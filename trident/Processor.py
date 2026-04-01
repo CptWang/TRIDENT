@@ -26,6 +26,7 @@ class Processor:
         skip_errors: bool = False,
         custom_mpp_keys: Optional[List[str]] = None,
         custom_list_of_wsis: Optional[str] = None,
+        annotation_vote_column: Optional[str] = None,
         max_workers: Optional[int] = None,
         reader_type: Optional[WSIReaderType] = None,
         search_nested: bool = False, 
@@ -70,6 +71,9 @@ class Processor:
                 these slides will be considered for processing. Defaults to None, which means all 
                 slides matching the wsi_ext extensions will be processed.
                 Note: If `custom_list_of_wsis` is provided, any names that do not match the available slides will be ignored, and a warning will be printed.
+            annotation_vote_column (str, optional):
+                Optional CSV column containing semicolon-separated annotation vote-map paths.
+                When provided, those paths are attached to each WSI and can be used for validation-only patch filtering.
             max_workers (int, optional):
                 Maximum number of workers for data loading. If None, the default behavior will be used.
                 Defaults to None.
@@ -137,8 +141,19 @@ class Processor:
                 wsi_df['mpp'].dropna().tolist()
                 if 'mpp' in wsi_df.columns else None
             )
+            if annotation_vote_column is not None:
+                if annotation_vote_column not in wsi_df.columns:
+                    raise ValueError(
+                        f"CSV must contain annotation vote column '{annotation_vote_column}'."
+                    )
+                valid_annotation_vote_paths = (
+                    wsi_df[annotation_vote_column].fillna("").astype(str).tolist()
+                )
+            else:
+                valid_annotation_vote_paths = None
         else:
             valid_mpps = None
+            valid_annotation_vote_paths = None
 
         print(f'[PROCESSOR] Found {len(full_paths)} valid slides in {wsi_source}.')
 
@@ -165,6 +180,11 @@ class Processor:
                     reader_type=reader_type,
                     lazy_init=True,
                 ))
+                if valid_annotation_vote_paths is not None:
+                    raw_vote_paths = valid_annotation_vote_paths[wsi_idx]
+                    slide.annotation_vote_paths = [
+                        path.strip() for path in raw_vote_paths.split(";") if path.strip()
+                    ]
                 self.wsis.append(slide)
         except Exception:
             stack.close()
@@ -296,6 +316,9 @@ class Processor:
         saveto: str | None = None, 
         visualize: bool = True,
         min_tissue_proportion: float = 0.,
+        validation_mode: bool = False,
+        min_high_confidence_proportion: float = 0.5,
+        max_low_confidence_proportion: float = 0.1,
     ) -> str:
         """
         The `run_patching_job` function extracts patches from the segmented tissue regions of slides. 
@@ -316,6 +339,13 @@ class Processor:
                 Whether to generate and save visualizations of the patches. Defaults to True.
             min_tissue_proportion: float, optional 
                 Minimum proportion of the patch under tissue to be kept. Defaults to 0. 
+            validation_mode (bool, optional):
+                If True, enable annotation-confidence filtering for validation-time patch export.
+                Requires each WSI to expose `annotation_vote_paths`.
+            min_high_confidence_proportion (float, optional):
+                Minimum proportion of patch area that must be covered by the highest-confidence vote value.
+            max_low_confidence_proportion (float, optional):
+                Maximum proportion of patch area that may contain lower-confidence votes.
 
         Returns:
             str: Absolute path to directory containing patch coordinates.
@@ -388,6 +418,10 @@ class Processor:
                     save_coords=os.path.join(self.job_dir, saveto),
                     overlap=overlap,
                     min_tissue_proportion=min_tissue_proportion,
+                    is_validation=validation_mode,
+                    annotation_vote_paths=getattr(wsi, "annotation_vote_paths", None),
+                    min_high_confidence_proportion=min_high_confidence_proportion,
+                    max_low_confidence_proportion=max_low_confidence_proportion,
                 )
 
                 # save tissue coords visualization

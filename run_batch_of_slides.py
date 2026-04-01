@@ -92,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Minimum proportion of the patch under tissue to be kept. Between 0. and 1.0. Defaults to 0.')
     parser.add_argument('--coords_dir', type=str, default=None, 
                         help='Directory to save/restore tissue coordinates.')
+    parser.add_argument('--validation_mode', action='store_true', default=False,
+                        help='Apply high-confidence annotation filtering when exporting validation patches.')
+    parser.add_argument('--annotation_vote_column', type=str, default=None,
+                        help='Optional CSV column containing semicolon-separated annotation vote TIFF paths for each slide.')
+    parser.add_argument('--min_high_confidence_proportion', type=float, default=0.5,
+                        help='Minimum patch-area proportion that must be covered by the highest-confidence vote count.')
+    parser.add_argument('--max_low_confidence_proportion', type=float, default=0.1,
+                        help='Maximum patch-area proportion allowed to contain lower-confidence votes.')
     
     # Feature extraction arguments 
     parser.add_argument('--patch_encoder', type=str, default='conch_v15', 
@@ -162,6 +170,7 @@ def initialize_processor(args: argparse.Namespace) -> Processor:
         skip_errors=args.skip_errors,
         custom_mpp_keys=args.custom_mpp_keys,
         custom_list_of_wsis=args.custom_list_of_wsis,
+        annotation_vote_column=args.annotation_vote_column,
         max_workers=args.max_workers,
         reader_type=args.reader_type,
         search_nested=args.search_nested,
@@ -213,7 +222,10 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             patch_size=args.patch_size,
             overlap=args.overlap,
             saveto=args.coords_dir,
-            min_tissue_proportion=args.min_tissue_proportion
+            min_tissue_proportion=args.min_tissue_proportion,
+            validation_mode=args.validation_mode,
+            min_high_confidence_proportion=args.min_high_confidence_proportion,
+            max_low_confidence_proportion=args.max_low_confidence_proportion,
         )
     elif args.task == 'feat':
         if args.slide_encoder is None: 

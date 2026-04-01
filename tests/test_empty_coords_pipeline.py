@@ -81,6 +81,11 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
         wsi.gdf_contours = self._tiny_tissue_mask()
         return wsi
 
+    def _write_vote_map(self, array: np.ndarray, name: str) -> str:
+        vote_path = os.path.join(self.tmpdir, name)
+        Image.fromarray(array.astype(np.uint8), mode="L").save(vote_path)
+        return vote_path
+
     def test_high_min_tissue_proportion_produces_empty_coords(self):
         wsi = self._build_wsi_with_mask()
         coords_path = wsi.extract_tissue_coords(
@@ -161,6 +166,51 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
         with h5py.File(slide_out, "r") as f:
             self.assertEqual(f["features"].shape, (0,))
             self.assertEqual(f["coords"].shape, (0, 2))
+
+    def test_validation_confidence_filter_keeps_only_high_agreement_patches(self):
+        wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
+
+        vote_map = np.zeros((1024, 1024), dtype=np.uint8)
+        vote_map[:512, :512] = 2
+        vote_map[:512, 512:] = 1
+        vote_map[512:819, :512] = 2
+        vote_map[819:859, :512] = 1
+        vote_map[512:812, 512:] = 2
+        vote_map[812:892, 512:] = 1
+        vote_path = self._write_vote_map(vote_map, "votes.tif")
+
+        coords_path = wsi.extract_tissue_coords(
+            target_mag=20,
+            patch_size=512,
+            save_coords=self.tmpdir,
+            is_validation=True,
+            annotation_vote_paths=vote_path,
+            min_high_confidence_proportion=0.5,
+            max_low_confidence_proportion=0.1,
+        )
+
+        attrs, coords = read_coords(coords_path)
+        np.testing.assert_array_equal(coords, np.array([[0, 0], [0, 512]], dtype=np.int64))
+        self.assertEqual(attrs["annotation_vote_max_count"], 2)
+        self.assertEqual(attrs["annotation_prefilter_patch_count"], 4)
+        self.assertEqual(attrs["annotation_postfilter_patch_count"], 2)
+
+    def test_training_mode_ignores_annotation_confidence_filter(self):
+        wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
+        vote_map = np.zeros((1024, 1024), dtype=np.uint8)
+        vote_map[:512, :512] = 2
+        vote_path = self._write_vote_map(vote_map, "train_votes.tif")
+
+        coords_path = wsi.extract_tissue_coords(
+            target_mag=20,
+            patch_size=512,
+            save_coords=self.tmpdir,
+            is_validation=False,
+            annotation_vote_paths=vote_path,
+        )
+
+        _, coords = read_coords(coords_path)
+        self.assertEqual(coords.shape, (4, 2))
 
 
 if __name__ == "__main__":

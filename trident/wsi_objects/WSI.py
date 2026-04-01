@@ -4,6 +4,7 @@ import os
 import warnings
 import torch 
 from typing import List, Tuple, Optional, Literal, Union
+from PIL import Image, ImageChops
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -225,6 +226,133 @@ class WSI:
             self, patch_size, src_pixel_size, dst_pixel_size, src_mag, dst_mag,
             overlap, mask, coords_only, custom_coords, threshold, pil
         )
+
+    @staticmethod
+    def _normalize_annotation_vote_paths(
+        annotation_vote_paths: Optional[Union[str, List[str]]]
+    ) -> List[str]:
+        if annotation_vote_paths is None:
+            return []
+
+        raw_values = (
+            [annotation_vote_paths]
+            if isinstance(annotation_vote_paths, str)
+            else list(annotation_vote_paths)
+        )
+
+        normalized: List[str] = []
+        seen = set()
+        for raw_value in raw_values:
+            if raw_value is None:
+                continue
+            for path in str(raw_value).split(";"):
+                cleaned = path.strip()
+                if cleaned and cleaned not in seen:
+                    normalized.append(cleaned)
+                    seen.add(cleaned)
+        return normalized
+
+    def _filter_coords_by_annotation_confidence(
+        self,
+        coords: List[Tuple[int, int]],
+        annotation_vote_paths: Optional[Union[str, List[str]]],
+        patch_size_level0: int,
+        min_high_confidence_proportion: float,
+        max_low_confidence_proportion: float,
+    ) -> Tuple[List[Tuple[int, int]], dict]:
+        vote_paths = self._normalize_annotation_vote_paths(annotation_vote_paths)
+        if not vote_paths:
+            raise ValueError(
+                "Validation-mode patch filtering requires `annotation_vote_paths`."
+            )
+
+        if not 0.0 <= min_high_confidence_proportion <= 1.0:
+            raise ValueError(
+                "min_high_confidence_proportion must be between 0.0 and 1.0."
+            )
+        if not 0.0 <= max_low_confidence_proportion <= 1.0:
+            raise ValueError(
+                "max_low_confidence_proportion must be between 0.0 and 1.0."
+            )
+
+        Image.MAX_IMAGE_PIXELS = None
+        vote_images: List[Image.Image] = []
+        max_vote_count = 0
+        try:
+            for vote_path in vote_paths:
+                if not os.path.exists(vote_path):
+                    raise FileNotFoundError(
+                        f"Annotation vote map not found: {vote_path}"
+                    )
+
+                vote_image = Image.open(vote_path)
+                if len(vote_image.getbands()) != 1:
+                    raise ValueError(
+                        f"Annotation vote map must be single-channel: {vote_path}"
+                    )
+                if vote_image.size != (self.width, self.height):
+                    raise ValueError(
+                        "Annotation vote map dimensions do not match the WSI. "
+                        f"Expected {(self.width, self.height)}, got {vote_image.size} "
+                        f"for {vote_path}."
+                    )
+
+                extrema = vote_image.getextrema()
+                if isinstance(extrema, tuple):
+                    max_vote_count = max(max_vote_count, int(extrema[1]))
+                vote_images.append(vote_image)
+
+            filtered_coords: List[Tuple[int, int]] = []
+            if max_vote_count < 1:
+                metadata = {
+                    "validation_mode": True,
+                    "annotation_vote_paths": ";".join(vote_paths),
+                    "annotation_vote_max_count": 0,
+                    "annotation_min_high_confidence_proportion": min_high_confidence_proportion,
+                    "annotation_max_low_confidence_proportion": max_low_confidence_proportion,
+                    "annotation_prefilter_patch_count": len(coords),
+                    "annotation_postfilter_patch_count": 0,
+                }
+                return filtered_coords, metadata
+
+            for x, y in coords:
+                right = min(x + patch_size_level0, self.width)
+                lower = min(y + patch_size_level0, self.height)
+                if right <= x or lower <= y:
+                    continue
+
+                combined_patch = None
+                for vote_image in vote_images:
+                    crop = vote_image.crop((x, y, right, lower))
+                    combined_patch = crop if combined_patch is None else ImageChops.lighter(combined_patch, crop)
+
+                hist = combined_patch.histogram() if combined_patch is not None else []
+                patch_area = (right - x) * (lower - y)
+                high_conf_pixels = hist[max_vote_count] if max_vote_count < len(hist) else 0
+                low_conf_pixels = sum(hist[1:max_vote_count]) if max_vote_count > 1 else 0
+
+                if patch_area == 0:
+                    continue
+
+                if (
+                    high_conf_pixels / patch_area >= min_high_confidence_proportion
+                    and low_conf_pixels / patch_area <= max_low_confidence_proportion
+                ):
+                    filtered_coords.append((x, y))
+        finally:
+            for vote_image in vote_images:
+                vote_image.close()
+
+        metadata = {
+            "validation_mode": True,
+            "annotation_vote_paths": ";".join(vote_paths),
+            "annotation_vote_max_count": max_vote_count,
+            "annotation_min_high_confidence_proportion": min_high_confidence_proportion,
+            "annotation_max_low_confidence_proportion": max_low_confidence_proportion,
+            "annotation_prefilter_patch_count": len(coords),
+            "annotation_postfilter_patch_count": len(filtered_coords),
+        }
+        return filtered_coords, metadata
     
     def _fetch_magnification(self, custom_mpp_keys: Optional[List[str]] = None) -> int:
         """
@@ -650,6 +778,10 @@ class WSI:
         save_coords: str,
         overlap: int = 0,
         min_tissue_proportion: float  = 0.,
+        is_validation: bool = False,
+        annotation_vote_paths: Optional[Union[str, List[str]]] = None,
+        min_high_confidence_proportion: float = 0.5,
+        max_low_confidence_proportion: float = 0.1,
     ) -> str:
         """
         Extract patch coordinates from tissue regions in the WSI.
@@ -668,6 +800,17 @@ class WSI:
             Overlap between patches in pixels. Defaults to 0.
         min_tissue_proportion : float, optional
             Minimum proportion of the patch under tissue to be kept. Defaults to 0. 
+        is_validation : bool, optional
+            If True, apply the annotation-confidence filter before saving coordinates. Defaults to False.
+        annotation_vote_paths : Optional[Union[str, List[str]]], optional
+            One or more semicolon-separated vote-map TIFF paths used to score annotation agreement.
+            Required when `is_validation=True`.
+        min_high_confidence_proportion : float, optional
+            Minimum proportion of the patch area that must be covered by the highest available vote count.
+            Defaults to 0.5.
+        max_low_confidence_proportion : float, optional
+            Maximum proportion of the patch area allowed to contain lower-confidence votes.
+            Defaults to 0.1.
 
         Returns
         -------
@@ -694,11 +837,23 @@ class WSI:
         )
 
         coords_to_keep = [(x, y) for x, y in patcher]
+        extra_attrs = {"validation_mode": bool(is_validation)}
+
+        if is_validation:
+            coords_to_keep, validation_attrs = self._filter_coords_by_annotation_confidence(
+                coords=coords_to_keep,
+                annotation_vote_paths=annotation_vote_paths,
+                patch_size_level0=patcher.patch_size_src,
+                min_high_confidence_proportion=min_high_confidence_proportion,
+                max_low_confidence_proportion=max_low_confidence_proportion,
+            )
+            extra_attrs.update(validation_attrs)
 
         os.makedirs(os.path.join(save_coords, 'patches'), exist_ok=True)
         out_fname = os.path.join(save_coords, 'patches', str(self.name) + '_patches.h5')
         coords_to_h5(coords_to_keep, out_fname, patch_size, self.mag, target_mag,
-                     save_coords, self.width, self.height, self.name, overlap)
+                     save_coords, self.width, self.height, self.name, overlap,
+                     extra_attrs=extra_attrs)
         return out_fname
 
     def visualize_coords(self, coords_path: str, save_patch_viz: str) -> str:

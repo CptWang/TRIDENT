@@ -548,7 +548,8 @@ def coords_to_h5(
     width, 
     height, 
     name,
-    overlap
+    overlap,
+    extra_attrs: Optional[dict] = None,
 ):
     """ Save tissue coordinates to .h5 """
     coords_array = np.asarray(coords, dtype=np.int64)
@@ -574,6 +575,8 @@ def coords_to_h5(
         'level0_width': width,
         'level0_height': height
     }
+    if extra_attrs:
+        attributes.update(extra_attrs)
 
     # Save the assets and attributes to an hdf5 file
     save_h5(save_path,

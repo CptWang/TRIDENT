@@ -46,6 +46,14 @@ def parse_arguments():
                         help='Absolute overlap for patching in pixels. Defaults to 0. ')
     parser.add_argument('--batch_size', type=int, default=32, 
                         help='Batch size for feature extraction. Defaults to 32.')
+    parser.add_argument('--validation_mode', action='store_true', default=False,
+                        help='Apply high-confidence annotation filtering when exporting validation patches.')
+    parser.add_argument('--annotation_vote_paths', type=str, default=None,
+                        help='Semicolon-separated annotation vote TIFF paths used for validation patch filtering.')
+    parser.add_argument('--min_high_confidence_proportion', type=float, default=0.5,
+                        help='Minimum patch-area proportion that must be covered by the highest-confidence vote count.')
+    parser.add_argument('--max_low_confidence_proportion', type=float, default=0.1,
+                        help='Maximum patch-area proportion allowed to contain lower-confidence votes.')
     return parser.parse_args()
 
 
@@ -96,7 +104,12 @@ def process_slide(args):
         coords_path = slide.extract_tissue_coords(
             target_mag=args.mag,
             patch_size=args.patch_size,
-            save_coords=save_coords
+            save_coords=save_coords,
+            overlap=args.overlap,
+            is_validation=args.validation_mode,
+            annotation_vote_paths=args.annotation_vote_paths,
+            min_high_confidence_proportion=args.min_high_confidence_proportion,
+            max_low_confidence_proportion=args.max_low_confidence_proportion,
         )
         print(f"Tissue coordinates extracted and saved to {coords_path}.")
 

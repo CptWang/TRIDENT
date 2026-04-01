@@ -186,7 +186,12 @@ class WSIPatcher:
             self.valid_patches_nb, self.valid_coords = self._compute_masked(coords, threshold)
         else:
             self.valid_patches_nb, self.valid_coords = len(coords), coords
-            
+
+        # add a customized filter for % of the mask that is 3/2/1/0
+        # if validation
+        #     select_only_highest_confidence_patches(coords, .json file (>50% 3 pathologist agreement and no 1 and 2 >10%))
+        #     # HARD: right now the patcher has a regular patching style (grid) you might be able to get more patches by not sticking with that grid
+        #     # Regular patching is fine as starting point
     @classmethod
     def from_legacy_coords(
         cls, 

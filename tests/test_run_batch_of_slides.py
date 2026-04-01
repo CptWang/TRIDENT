@@ -16,6 +16,9 @@ class _DummyProcessor:
     def run_segmentation_job(self, *args, **kwargs):
         self.calls.append((args, kwargs))
 
+    def run_patching_job(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
 
 class TestRunBatchOfSlides(unittest.TestCase):
     def _base_args(self, segmenter: str):
@@ -32,6 +35,14 @@ class TestRunBatchOfSlides(unittest.TestCase):
         args.seg_batch_size = None
         args.batch_size = 8
         args.gpu = 2
+        args.mag = 20
+        args.patch_size = 256
+        args.overlap = 0
+        args.coords_dir = None
+        args.min_tissue_proportion = 0.0
+        args.validation_mode = False
+        args.min_high_confidence_proportion = 0.5
+        args.max_low_confidence_proportion = 0.1
         return args
 
     def test_run_task_seg_uses_cpu_for_otsu(self):
@@ -55,6 +66,22 @@ class TestRunBatchOfSlides(unittest.TestCase):
         self.assertEqual(len(processor.calls), 1)
         kwargs = processor.calls[0][1]
         self.assertEqual(kwargs["device"], "cuda:2")
+
+    def test_run_task_coords_passes_validation_filter_args(self):
+        processor = _DummyProcessor()
+        args = self._base_args("hest")
+        args.task = "coords"
+        args.validation_mode = True
+        args.min_high_confidence_proportion = 0.6
+        args.max_low_confidence_proportion = 0.05
+
+        batch_mod.run_task(processor, args)
+
+        self.assertEqual(len(processor.calls), 1)
+        kwargs = processor.calls[0][1]
+        self.assertTrue(kwargs["validation_mode"])
+        self.assertEqual(kwargs["min_high_confidence_proportion"], 0.6)
+        self.assertEqual(kwargs["max_low_confidence_proportion"], 0.05)
 
 
 if __name__ == "__main__":
