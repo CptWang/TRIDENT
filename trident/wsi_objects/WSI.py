@@ -333,7 +333,9 @@ class WSI:
             if max_vote_count < 1:
                 metadata = {
                     "validation_mode": True,
-                    "annotation_vote_paths": ";".join(vote_paths),
+                    "annotation_vote_paths": vote_paths[0],
+                    "annotation_vote_interpretation": "compact_soft_label_carcinoma_votes",
+                    "annotation_background_is_high_confidence": False,
                     "annotation_vote_max_count": 0,
                     "annotation_min_high_confidence_proportion": min_high_confidence_proportion,
                     "annotation_max_low_confidence_proportion": max_low_confidence_proportion,
@@ -360,7 +362,7 @@ class WSI:
                     effective_vote_hist[effective_votes] += pixel_count
 
                 patch_area = (right - x) * (lower - y)
-                high_conf_pixels = effective_vote_hist[max_vote_count]
+                high_conf_pixels = effective_vote_hist[0] + effective_vote_hist[max_vote_count]
                 low_conf_pixels = sum(effective_vote_hist[1:max_vote_count])
 
                 if patch_area == 0:
@@ -379,6 +381,7 @@ class WSI:
             "validation_mode": True,
             "annotation_vote_paths": vote_paths[0],
             "annotation_vote_interpretation": "compact_soft_label_carcinoma_votes",
+            "annotation_background_is_high_confidence": True,
             "annotation_vote_max_count": max_vote_count,
             "annotation_min_high_confidence_proportion": min_high_confidence_proportion,
             "annotation_max_low_confidence_proportion": max_low_confidence_proportion,

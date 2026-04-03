@@ -174,8 +174,7 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
         vote_map[:512, :512] = 3
         vote_map[:512, 512:] = 24
         vote_map[512:, :512] = 21
-        vote_map[512:812, 512:] = 24
-        vote_map[812:, 512:] = 21
+        vote_map[512:712, 512:] = 24
         vote_path = self._write_vote_map(vote_map, "votes.tif")
 
         coords_path = wsi.extract_tissue_coords(
@@ -189,14 +188,41 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
         )
 
         attrs, coords = read_coords(coords_path)
-        np.testing.assert_array_equal(coords, np.array([[0, 0], [512, 0]], dtype=np.int64))
+        np.testing.assert_array_equal(
+            coords,
+            np.array([[0, 0], [512, 0], [512, 512]], dtype=np.int64),
+        )
         self.assertEqual(attrs["annotation_vote_max_count"], 3)
         self.assertEqual(attrs["annotation_prefilter_patch_count"], 4)
-        self.assertEqual(attrs["annotation_postfilter_patch_count"], 2)
+        self.assertEqual(attrs["annotation_postfilter_patch_count"], 3)
         self.assertEqual(
             attrs["annotation_vote_interpretation"],
             "compact_soft_label_carcinoma_votes",
         )
+        self.assertTrue(attrs["annotation_background_is_high_confidence"])
+
+    def test_validation_confidence_filter_drops_background_only_slides(self):
+        wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
+        vote_path = self._write_vote_map(
+            np.zeros((1024, 1024), dtype=np.uint8),
+            "background_only_votes.tif",
+        )
+
+        coords_path = wsi.extract_tissue_coords(
+            target_mag=20,
+            patch_size=512,
+            save_coords=self.tmpdir,
+            is_validation=True,
+            annotation_vote_paths=vote_path,
+            min_high_confidence_proportion=0.5,
+            max_low_confidence_proportion=0.1,
+        )
+
+        attrs, coords = read_coords(coords_path)
+        self.assertEqual(coords.shape, (0, 2))
+        self.assertEqual(attrs["annotation_vote_max_count"], 0)
+        self.assertEqual(attrs["annotation_postfilter_patch_count"], 0)
+        self.assertFalse(attrs["annotation_background_is_high_confidence"])
 
     def test_training_mode_ignores_annotation_confidence_filter(self):
         wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
