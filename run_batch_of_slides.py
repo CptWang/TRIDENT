@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation_mode', action='store_true', default=False,
                         help='Apply high-confidence annotation filtering when exporting validation patches.')
     parser.add_argument('--annotation_vote_column', type=str, default=None,
-                        help='Optional CSV column containing semicolon-separated annotation vote TIFF paths for each slide.')
+                        help='Optional CSV column containing the compact soft-label TIFF path for each slide.')
     parser.add_argument('--min_high_confidence_proportion', type=float, default=0.5,
                         help='Minimum patch-area proportion that must be covered by the highest-confidence vote count.')
     parser.add_argument('--max_low_confidence_proportion', type=float, default=0.1,

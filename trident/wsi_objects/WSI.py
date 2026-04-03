@@ -4,7 +4,7 @@ import os
 import warnings
 import torch 
 from typing import List, Tuple, Optional, Literal, Union
-from PIL import Image, ImageChops
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -252,6 +252,25 @@ class WSI:
                     seen.add(cleaned)
         return normalized
 
+    @staticmethod
+    def _decode_compact_soft_label_carcinoma_votes(label_value: int) -> int:
+        if label_value == 0:
+            return 0
+        if 1 <= label_value <= 3:
+            return label_value
+        if 11 <= label_value <= 13:
+            return label_value - 10
+        if 21 <= label_value <= 29:
+            encoded_value = label_value - 20
+            invasive_votes = ((encoded_value - 1) // 3) + 1
+            in_situ_votes = ((encoded_value - 1) % 3) + 1
+            return min(3, invasive_votes + in_situ_votes)
+
+        raise ValueError(
+            "Unsupported compact soft-label value "
+            f"{label_value}. Expected values from the compact carcinoma codebook."
+        )
+
     def _filter_coords_by_annotation_confidence(
         self,
         coords: List[Tuple[int, int]],
@@ -265,6 +284,10 @@ class WSI:
             raise ValueError(
                 "Validation-mode patch filtering requires `annotation_vote_paths`."
             )
+        if len(vote_paths) != 1:
+            raise ValueError(
+                "Validation-mode patch filtering expects exactly one compact soft-label TIFF."
+            )
 
         if not 0.0 <= min_high_confidence_proportion <= 1.0:
             raise ValueError(
@@ -276,31 +299,35 @@ class WSI:
             )
 
         Image.MAX_IMAGE_PIXELS = None
-        vote_images: List[Image.Image] = []
+        compact_label_image: Optional[Image.Image] = None
         max_vote_count = 0
         try:
-            for vote_path in vote_paths:
-                if not os.path.exists(vote_path):
-                    raise FileNotFoundError(
-                        f"Annotation vote map not found: {vote_path}"
-                    )
+            vote_path = vote_paths[0]
+            if not os.path.exists(vote_path):
+                raise FileNotFoundError(
+                    f"Annotation vote map not found: {vote_path}"
+                )
 
-                vote_image = Image.open(vote_path)
-                if len(vote_image.getbands()) != 1:
-                    raise ValueError(
-                        f"Annotation vote map must be single-channel: {vote_path}"
-                    )
-                if vote_image.size != (self.width, self.height):
-                    raise ValueError(
-                        "Annotation vote map dimensions do not match the WSI. "
-                        f"Expected {(self.width, self.height)}, got {vote_image.size} "
-                        f"for {vote_path}."
-                    )
+            compact_label_image = Image.open(vote_path)
+            if len(compact_label_image.getbands()) != 1:
+                raise ValueError(
+                    f"Annotation vote map must be single-channel: {vote_path}"
+                )
+            if compact_label_image.size != (self.width, self.height):
+                raise ValueError(
+                    "Annotation vote map dimensions do not match the WSI. "
+                    f"Expected {(self.width, self.height)}, got {compact_label_image.size} "
+                    f"for {vote_path}."
+                )
 
-                extrema = vote_image.getextrema()
-                if isinstance(extrema, tuple):
-                    max_vote_count = max(max_vote_count, int(extrema[1]))
-                vote_images.append(vote_image)
+            full_hist = compact_label_image.histogram()
+            for label_value, pixel_count in enumerate(full_hist):
+                if pixel_count == 0:
+                    continue
+                max_vote_count = max(
+                    max_vote_count,
+                    self._decode_compact_soft_label_carcinoma_votes(label_value),
+                )
 
             filtered_coords: List[Tuple[int, int]] = []
             if max_vote_count < 1:
@@ -321,15 +348,20 @@ class WSI:
                 if right <= x or lower <= y:
                     continue
 
-                combined_patch = None
-                for vote_image in vote_images:
-                    crop = vote_image.crop((x, y, right, lower))
-                    combined_patch = crop if combined_patch is None else ImageChops.lighter(combined_patch, crop)
+                crop = compact_label_image.crop((x, y, right, lower))
+                hist = crop.histogram()
+                effective_vote_hist = [0] * (max_vote_count + 1)
+                for label_value, pixel_count in enumerate(hist):
+                    if pixel_count == 0:
+                        continue
+                    effective_votes = self._decode_compact_soft_label_carcinoma_votes(
+                        label_value
+                    )
+                    effective_vote_hist[effective_votes] += pixel_count
 
-                hist = combined_patch.histogram() if combined_patch is not None else []
                 patch_area = (right - x) * (lower - y)
-                high_conf_pixels = hist[max_vote_count] if max_vote_count < len(hist) else 0
-                low_conf_pixels = sum(hist[1:max_vote_count]) if max_vote_count > 1 else 0
+                high_conf_pixels = effective_vote_hist[max_vote_count]
+                low_conf_pixels = sum(effective_vote_hist[1:max_vote_count])
 
                 if patch_area == 0:
                     continue
@@ -340,12 +372,13 @@ class WSI:
                 ):
                     filtered_coords.append((x, y))
         finally:
-            for vote_image in vote_images:
-                vote_image.close()
+            if compact_label_image is not None:
+                compact_label_image.close()
 
         metadata = {
             "validation_mode": True,
-            "annotation_vote_paths": ";".join(vote_paths),
+            "annotation_vote_paths": vote_paths[0],
+            "annotation_vote_interpretation": "compact_soft_label_carcinoma_votes",
             "annotation_vote_max_count": max_vote_count,
             "annotation_min_high_confidence_proportion": min_high_confidence_proportion,
             "annotation_max_low_confidence_proportion": max_low_confidence_proportion,
@@ -803,7 +836,7 @@ class WSI:
         is_validation : bool, optional
             If True, apply the annotation-confidence filter before saving coordinates. Defaults to False.
         annotation_vote_paths : Optional[Union[str, List[str]]], optional
-            One or more semicolon-separated vote-map TIFF paths used to score annotation agreement.
+            Path to the compact soft-label TIFF used to score annotation agreement.
             Required when `is_validation=True`.
         min_high_confidence_proportion : float, optional
             Minimum proportion of the patch area that must be covered by the highest available vote count.

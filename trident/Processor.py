@@ -72,8 +72,8 @@ class Processor:
                 slides matching the wsi_ext extensions will be processed.
                 Note: If `custom_list_of_wsis` is provided, any names that do not match the available slides will be ignored, and a warning will be printed.
             annotation_vote_column (str, optional):
-                Optional CSV column containing semicolon-separated annotation vote-map paths.
-                When provided, those paths are attached to each WSI and can be used for validation-only patch filtering.
+                Optional CSV column containing the compact soft-label TIFF path.
+                When provided, that path is attached to each WSI and can be used for validation-only patch filtering.
             max_workers (int, optional):
                 Maximum number of workers for data loading. If None, the default behavior will be used.
                 Defaults to None.
@@ -182,9 +182,7 @@ class Processor:
                 ))
                 if valid_annotation_vote_paths is not None:
                     raw_vote_paths = valid_annotation_vote_paths[wsi_idx]
-                    slide.annotation_vote_paths = [
-                        path.strip() for path in raw_vote_paths.split(";") if path.strip()
-                    ]
+                    slide.annotation_vote_paths = raw_vote_paths.strip()
                 self.wsis.append(slide)
         except Exception:
             stack.close()

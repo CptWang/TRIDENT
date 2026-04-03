@@ -49,7 +49,7 @@ def parse_arguments():
     parser.add_argument('--validation_mode', action='store_true', default=False,
                         help='Apply high-confidence annotation filtering when exporting validation patches.')
     parser.add_argument('--annotation_vote_paths', type=str, default=None,
-                        help='Semicolon-separated annotation vote TIFF paths used for validation patch filtering.')
+                        help='Path to the compact soft-label TIFF used for validation patch filtering.')
     parser.add_argument('--min_high_confidence_proportion', type=float, default=0.5,
                         help='Minimum patch-area proportion that must be covered by the highest-confidence vote count.')
     parser.add_argument('--max_low_confidence_proportion', type=float, default=0.1,
