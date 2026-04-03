@@ -27,12 +27,18 @@ class TestRunBatchOfSlides(unittest.TestCase):
 
         args = Args()
         args.task = "seg"
+        args.segmentation_source = "model"
         args.segmenter = segmenter
         args.seg_conf_thresh = 0.5
         args.remove_holes = False
         args.remove_artifacts = False
         args.remove_penmarks = False
         args.seg_batch_size = None
+        args.custom_list_of_wsis = None
+        args.manual_tissue_mask_column = None
+        args.manual_mask_source_level = 4
+        args.manual_mask_target_level = 0
+        args.manual_mask_tissue_thr = 0
         args.batch_size = 8
         args.gpu = 2
         args.mag = 20
@@ -55,6 +61,7 @@ class TestRunBatchOfSlides(unittest.TestCase):
         self.assertEqual(len(processor.calls), 1)
         kwargs = processor.calls[0][1]
         self.assertEqual(kwargs["device"], "cpu")
+        self.assertEqual(kwargs["segmentation_source"], "model")
 
     def test_run_task_seg_uses_gpu_for_hest(self):
         processor = _DummyProcessor()
@@ -66,6 +73,46 @@ class TestRunBatchOfSlides(unittest.TestCase):
         self.assertEqual(len(processor.calls), 1)
         kwargs = processor.calls[0][1]
         self.assertEqual(kwargs["device"], "cuda:2")
+        self.assertEqual(kwargs["segmentation_source"], "model")
+
+    def test_run_task_seg_manual_mask_requires_custom_list(self):
+        processor = _DummyProcessor()
+        args = self._base_args("hest")
+        args.segmentation_source = "manual_mask"
+        args.manual_tissue_mask_column = "manual_mask"
+
+        with self.assertRaises(ValueError):
+            batch_mod.run_task(processor, args)
+
+    def test_run_task_seg_manual_mask_requires_mask_column(self):
+        processor = _DummyProcessor()
+        args = self._base_args("hest")
+        args.segmentation_source = "manual_mask"
+        args.custom_list_of_wsis = "/tmp/wsis.csv"
+        args.manual_tissue_mask_column = None
+
+        with self.assertRaises(ValueError):
+            batch_mod.run_task(processor, args)
+
+    def test_run_task_seg_manual_mask_dispatches_to_processor(self):
+        processor = _DummyProcessor()
+        args = self._base_args("hest")
+        args.segmentation_source = "manual_mask"
+        args.custom_list_of_wsis = "/tmp/wsis.csv"
+        args.manual_tissue_mask_column = "manual_mask"
+        args.manual_mask_source_level = 5
+        args.manual_mask_target_level = 0
+        args.manual_mask_tissue_thr = 1
+
+        batch_mod.run_task(processor, args)
+
+        self.assertEqual(len(processor.calls), 1)
+        kwargs = processor.calls[0][1]
+        self.assertEqual(kwargs["segmentation_source"], "manual_mask")
+        self.assertEqual(kwargs["manual_mask_source_level"], 5)
+        self.assertEqual(kwargs["manual_mask_target_level"], 0)
+        self.assertEqual(kwargs["manual_mask_tissue_thr"], 1)
+        self.assertIsNone(kwargs["segmentation_model"])
 
     def test_run_task_coords_passes_validation_filter_args(self):
         processor = _DummyProcessor()

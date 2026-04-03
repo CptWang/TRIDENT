@@ -228,6 +228,131 @@ class WSI:
         )
 
     @staticmethod
+    def _resize_nearest_nd(arr: np.ndarray, target_shape: Tuple[int, ...]) -> np.ndarray:
+        if arr.shape == target_shape:
+            return arr
+        if arr.ndim != len(target_shape):
+            raise ValueError(
+                f"Resize ndim mismatch: arr.ndim={arr.ndim}, target ndim={len(target_shape)}"
+            )
+
+        indexers = []
+        for src_len, dst_len in zip(arr.shape, target_shape):
+            if dst_len <= 0:
+                raise ValueError(f"Invalid target size {dst_len} in shape {target_shape}")
+            if src_len == dst_len:
+                idx = np.arange(src_len, dtype=np.int64)
+            else:
+                idx = np.linspace(0, src_len - 1, num=dst_len)
+                idx = np.rint(idx).astype(np.int64)
+                idx = np.clip(idx, 0, src_len - 1)
+            indexers.append(idx)
+        return arr[np.ix_(*indexers)]
+
+    @staticmethod
+    def _infer_z_axis_safe(src_shape: Tuple[int, ...], tgt_shape: Tuple[int, ...]) -> int:
+        if len(src_shape) != len(tgt_shape):
+            raise ValueError(f"Shape ndim mismatch src={src_shape} tgt={tgt_shape}")
+
+        if len(src_shape) == 2:
+            return 0
+
+        ratios: List[float] = []
+        for src_dim, tgt_dim in zip(src_shape, tgt_shape):
+            if src_dim <= 0:
+                ratios.append(float("inf"))
+            else:
+                ratios.append(float(tgt_dim) / float(src_dim))
+
+        finite = [(axis, abs(ratio - 1.0)) for axis, ratio in enumerate(ratios) if np.isfinite(ratio)]
+        if finite:
+            finite.sort(key=lambda x: x[1])
+            best_axis, best_error = finite[0]
+            if len(finite) == 1 or (
+                len(finite) >= 2 and best_error < 0.15 and best_error + 0.15 < finite[1][1]
+            ):
+                return int(best_axis)
+
+        return int(np.argmin(src_shape))
+
+    @classmethod
+    def _reconstruct_manual_mask_2d_from_zarr(
+        cls,
+        mask_path: str,
+        source_level: int,
+        target_level: int,
+        tissue_thr: int = 0,
+    ) -> np.ndarray:
+        try:
+            import zarr
+        except ImportError as exc:
+            raise ImportError(
+                "Manual mask segmentation requires zarr. Install TRIDENT with OME-Zarr extras."
+            ) from exc
+
+        root = zarr.open(mask_path, mode="r")
+        if isinstance(root, zarr.Array):
+            raise ValueError(
+                "Input mask path must point to a pyramid Zarr group containing level arrays ('0', '1', ...)."
+            )
+
+        source_key = str(source_level)
+        target_key = str(target_level)
+        array_keys = list(root.array_keys())
+        available_levels = sorted(array_keys, key=lambda key: int(key) if str(key).isdigit() else str(key))
+        if source_key not in array_keys:
+            raise ValueError(f"source_level={source_level} not found in {mask_path}. Available levels: {available_levels}")
+        if target_key not in array_keys:
+            raise ValueError(f"target_level={target_level} not found in {mask_path}. Available levels: {available_levels}")
+
+        source_arr = root[source_key]
+        target_arr = root[target_key]
+        source_data = np.asarray(source_arr[:])
+        target_shape = tuple(int(dim) for dim in target_arr.shape)
+
+        if source_data.ndim < 2:
+            raise ValueError(f"Expected at least 2D data in manual mask, got shape={source_data.shape}")
+        if source_data.ndim > 3:
+            raise ValueError(
+                f"Expected 2D or 3D manual mask data, got shape={source_data.shape}."
+            )
+        source_bool = source_data > tissue_thr
+
+        if source_bool.ndim == 2:
+            if len(target_shape) == 2:
+                target_2d_shape = target_shape
+            elif len(target_shape) == 3:
+                # Fallback for target pyramids that keep a singleton/channel axis.
+                target_2d_shape = tuple(int(dim) for dim in target_shape[-2:])
+            else:
+                raise ValueError(
+                    f"Unsupported target shape={target_shape} for 2D source shape={source_data.shape}."
+                )
+            resized = cls._resize_nearest_nd(source_bool, target_2d_shape)
+            return resized.astype(bool, copy=False)
+
+        # source_bool.ndim == 3
+        if len(target_shape) == 3:
+            z_axis = cls._infer_z_axis_safe(tuple(source_data.shape), target_shape)
+            target_2d_shape = tuple(dim for axis, dim in enumerate(target_shape) if axis != z_axis)
+        elif len(target_shape) == 2:
+            # If target already stores 2D masks, infer z from source only.
+            z_axis = int(np.argmin(source_data.shape))
+            target_2d_shape = target_shape
+        else:
+            raise ValueError(
+                f"Unsupported target shape={target_shape} for 3D source shape={source_data.shape}."
+            )
+
+        projected = np.max(source_bool, axis=z_axis)
+        if projected.ndim != 2:
+            raise ValueError(
+                f"Expected 2D projection from source shape={source_data.shape}, got projected shape={projected.shape}."
+            )
+        resized_non_z = cls._resize_nearest_nd(projected, target_2d_shape)
+        return resized_non_z.astype(bool, copy=False)
+
+    @staticmethod
     def _normalize_annotation_vote_paths(
         annotation_vote_paths: Optional[Union[str, List[str]]]
     ) -> List[str]:
@@ -651,6 +776,89 @@ class WSI:
             return gdf_saveto
         else:
             return gdf_contours
+
+    def segment_tissue_from_manual_mask(
+        self,
+        mask_path: str,
+        source_level: int = 4,
+        target_level: int = 0,
+        tissue_thr: int = 0,
+        holes_are_tissue: bool = False,
+        job_dir: Optional[str] = None,
+    ) -> Union[str, gpd.GeoDataFrame]:
+        """
+        Build tissue contours from a precomputed manual mask Zarr pyramid.
+
+        The mask is reconstructed in the target level with nearest-neighbor resizing,
+        projected to 2D (if needed), validated against slide dimensions, and converted
+        to contours using the standard TRIDENT contour pipeline.
+        """
+
+        self._lazy_initialize()
+
+        if not str(mask_path).strip():
+            raise ValueError("manual mask path is empty. Provide a valid mask path.")
+
+        resolved_mask_path = os.path.expanduser(str(mask_path).strip())
+        if not os.path.exists(resolved_mask_path):
+            raise FileNotFoundError(f"Manual mask not found: {resolved_mask_path}")
+
+        if source_level < 0 or target_level < 0:
+            raise ValueError("source_level and target_level must be non-negative integers.")
+
+        mask2d = self._reconstruct_manual_mask_2d_from_zarr(
+            mask_path=resolved_mask_path,
+            source_level=source_level,
+            target_level=target_level,
+            tissue_thr=tissue_thr,
+        )
+        if mask2d.ndim != 2:
+            raise ValueError(
+                f"Expected reconstructed manual mask to be 2D, got shape={mask2d.shape}."
+            )
+        if tuple(mask2d.shape) != (self.height, self.width):
+            raise ValueError(
+                "Reconstructed manual mask dimensions do not match WSI level-0 dimensions. "
+                f"Expected {(self.height, self.width)}, got {tuple(mask2d.shape)} for {resolved_mask_path}."
+            )
+
+        predicted_mask = (mask2d.astype(np.uint8) * 255).astype(np.uint8, copy=False)
+        gdf_contours = mask_to_gdf(
+            mask=predicted_mask,
+            max_nb_holes=0 if holes_are_tissue else 20,
+            min_contour_area=1000,
+            pixel_size=self.mpp,
+            contour_scale=1.0,
+        )
+        self.gdf_contours = gdf_contours
+
+        if job_dir is None:
+            self.tissue_seg_path = None
+            return gdf_contours
+
+        max_dimension = 1000
+        if self.width > self.height:
+            thumbnail_width = max_dimension
+            thumbnail_height = int(thumbnail_width * self.height / self.width)
+        else:
+            thumbnail_height = max_dimension
+            thumbnail_width = int(thumbnail_height * self.width / self.height)
+        thumbnail = self.get_thumbnail((thumbnail_width, thumbnail_height))
+
+        thumbnail_saveto = os.path.join(job_dir, "thumbnails", f"{self.name}.jpg")
+        os.makedirs(os.path.dirname(thumbnail_saveto), exist_ok=True)
+        thumbnail.save(thumbnail_saveto)
+
+        gdf_saveto = os.path.join(job_dir, "contours_geojson", f"{self.name}.geojson")
+        os.makedirs(os.path.dirname(gdf_saveto), exist_ok=True)
+        gdf_contours.set_crs("EPSG:3857", inplace=True)
+        gdf_contours.to_file(gdf_saveto, driver="GeoJSON")
+        self.tissue_seg_path = gdf_saveto
+
+        contours_saveto = os.path.join(job_dir, "contours", f"{self.name}.jpg")
+        annotated = np.array(thumbnail)
+        overlay_gdf_on_thumbnail(gdf_contours, annotated, contours_saveto, thumbnail_width / self.width)
+        return gdf_saveto
 
     @torch.inference_mode()
     def segment_semantic(

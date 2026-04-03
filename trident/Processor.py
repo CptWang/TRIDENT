@@ -27,6 +27,7 @@ class Processor:
         custom_mpp_keys: Optional[List[str]] = None,
         custom_list_of_wsis: Optional[str] = None,
         annotation_vote_column: Optional[str] = None,
+        manual_tissue_mask_column: Optional[str] = None,
         max_workers: Optional[int] = None,
         reader_type: Optional[WSIReaderType] = None,
         search_nested: bool = False, 
@@ -74,6 +75,9 @@ class Processor:
             annotation_vote_column (str, optional):
                 Optional CSV column containing the compact soft-label TIFF path.
                 When provided, that path is attached to each WSI and can be used for validation-only patch filtering.
+            manual_tissue_mask_column (str, optional):
+                Optional CSV column containing manual tissue mask paths (Zarr stores).
+                Used when segmentation is run in `segmentation_source='manual_mask'` mode.
             max_workers (int, optional):
                 Maximum number of workers for data loading. If None, the default behavior will be used.
                 Defaults to None.
@@ -151,9 +155,20 @@ class Processor:
                 )
             else:
                 valid_annotation_vote_paths = None
+            if manual_tissue_mask_column is not None:
+                if manual_tissue_mask_column not in wsi_df.columns:
+                    raise ValueError(
+                        f"CSV must contain manual tissue mask column '{manual_tissue_mask_column}'."
+                    )
+                valid_manual_tissue_mask_paths = (
+                    wsi_df[manual_tissue_mask_column].fillna("").astype(str).tolist()
+                )
+            else:
+                valid_manual_tissue_mask_paths = None
         else:
             valid_mpps = None
             valid_annotation_vote_paths = None
+            valid_manual_tissue_mask_paths = None
 
         print(f'[PROCESSOR] Found {len(full_paths)} valid slides in {wsi_source}.')
 
@@ -183,6 +198,9 @@ class Processor:
                 if valid_annotation_vote_paths is not None:
                     raw_vote_paths = valid_annotation_vote_paths[wsi_idx]
                     slide.annotation_vote_paths = raw_vote_paths.strip()
+                if valid_manual_tissue_mask_paths is not None:
+                    raw_manual_mask_path = valid_manual_tissue_mask_paths[wsi_idx]
+                    slide.manual_tissue_mask_path = raw_manual_mask_path.strip()
                 self.wsis.append(slide)
         except Exception:
             stack.close()
@@ -191,12 +209,16 @@ class Processor:
 
     def run_segmentation_job(
         self, 
-        segmentation_model: torch.nn.Module, 
+        segmentation_model: Optional[torch.nn.Module] = None, 
         seg_mag: int = 10, 
         holes_are_tissue: bool = False,
         batch_size: int = 16,
         artifact_remover_model: torch.nn.Module = None,
         device: str = 'cuda:0', 
+        segmentation_source: str = 'model',
+        manual_mask_source_level: int = 4,
+        manual_mask_target_level: int = 0,
+        manual_mask_tissue_thr: int = 0,
     ) -> str:
         """
         The `run_segmentation_job` function performs tissue segmentation on all slides managed by the processor. 
@@ -218,6 +240,15 @@ class Processor:
                 A pre-trained PyTorch model that can remove artifacts from an existing segmentation. Defaults to None.
             device (str): 
                 The computation device to use (e.g., 'cuda:0' for GPU or 'cpu' for CPU).
+            segmentation_source (str, optional):
+                Segmentation backend to use. `model` (default) runs the model-based path;
+                `manual_mask` loads a precomputed mask path per slide.
+            manual_mask_source_level (int, optional):
+                Source pyramid level in the manual mask Zarr. Defaults to 4.
+            manual_mask_target_level (int, optional):
+                Target pyramid level in the manual mask Zarr. Defaults to 0.
+            manual_mask_tissue_thr (int, optional):
+                Threshold applied to manual mask values before booleanization. Defaults to 0.
 
         Returns:
             str: Absolute path to where directory containing contours is saved.
@@ -230,6 +261,15 @@ class Processor:
         >>> model = TissueSegmenter()
         >>> processor.run_segmentation_job(segmentation_model=model, seg_mag=20)
         """
+        if segmentation_source not in ('model', 'manual_mask'):
+            raise ValueError(
+                f"Unsupported segmentation_source='{segmentation_source}'. Use 'model' or 'manual_mask'."
+            )
+        if segmentation_source == 'model' and segmentation_model is None:
+            raise ValueError("`segmentation_model` is required when segmentation_source='model'.")
+        if segmentation_source == 'manual_mask' and artifact_remover_model is not None:
+            raise ValueError("`artifact_remover_model` is only supported when segmentation_source='model'.")
+
         saveto = os.path.join(self.job_dir, 'contours')
         os.makedirs(saveto, exist_ok=True)
 
@@ -259,23 +299,43 @@ class Processor:
                 create_lock(os.path.join(saveto, f'{wsi.name}.jpg'))
                 update_log(os.path.join(self.job_dir, '_logs_segmentation.txt'), f'{wsi.name}{wsi.ext}', 'LOCKED. Segmenting tissue...')
 
-                # call a function from WSI object to do the work
-                gdf_saveto = wsi.segment_tissue(
-                    segmentation_model=segmentation_model,
-                    target_mag=seg_mag,
-                    holes_are_tissue=holes_are_tissue,
-                    job_dir=self.job_dir,
-                    batch_size=batch_size,
-                    device=device
-                )
-
-                # additionally remove artifacts for better segmentation.
-                if artifact_remover_model is not None:
+                if segmentation_source == 'model':
+                    # call a function from WSI object to do the work
                     gdf_saveto = wsi.segment_tissue(
-                        segmentation_model=artifact_remover_model,
-                        target_mag=artifact_remover_model.target_mag,
-                        holes_are_tissue=False,
-                        job_dir=self.job_dir
+                        segmentation_model=segmentation_model,
+                        target_mag=seg_mag,
+                        holes_are_tissue=holes_are_tissue,
+                        job_dir=self.job_dir,
+                        batch_size=batch_size,
+                        device=device
+                    )
+
+                    # additionally remove artifacts for better segmentation.
+                    if artifact_remover_model is not None:
+                        gdf_saveto = wsi.segment_tissue(
+                            segmentation_model=artifact_remover_model,
+                            target_mag=artifact_remover_model.target_mag,
+                            holes_are_tissue=False,
+                            job_dir=self.job_dir
+                        )
+                else:
+                    manual_mask_path = str(getattr(wsi, "manual_tissue_mask_path", "")).strip()
+                    if not manual_mask_path:
+                        raise ValueError(
+                            f"Missing manual tissue mask path for slide '{wsi.name}{wsi.ext}'. "
+                            "Provide a non-empty path in the configured manual tissue mask CSV column."
+                        )
+                    if not os.path.exists(manual_mask_path):
+                        raise FileNotFoundError(
+                            f"Manual tissue mask not found for slide '{wsi.name}{wsi.ext}': {manual_mask_path}"
+                        )
+                    gdf_saveto = wsi.segment_tissue_from_manual_mask(
+                        mask_path=manual_mask_path,
+                        source_level=manual_mask_source_level,
+                        target_level=manual_mask_target_level,
+                        tissue_thr=manual_mask_tissue_thr,
+                        holes_are_tissue=holes_are_tissue,
+                        job_dir=self.job_dir,
                     )
 
                 remove_lock(os.path.join(saveto, f'{wsi.name}.jpg'))

@@ -23,6 +23,8 @@ def parse_arguments():
     parser.add_argument("--gpu", type=int, default=0, help="GPU index to use for processing tasks")
     parser.add_argument("--slide_path", type=str, required=True, help="Path to the WSI file to process")
     parser.add_argument("--job_dir", type=str, required=True, help="Directory to store outputs")
+    parser.add_argument("--segmentation_source", type=str, default="model", choices=["model", "manual_mask"],
+                        help="Segmentation source: model-based segmentation (`model`) or precomputed mask path (`manual_mask`).")
     parser.add_argument('--patch_encoder', type=str, default='conch_v15', 
                         choices=patch_encoder_registry.keys(),
                         help='Patch encoder to use')
@@ -50,6 +52,14 @@ def parse_arguments():
                         help='Apply high-confidence annotation filtering when exporting validation patches.')
     parser.add_argument('--annotation_vote_paths', type=str, default=None,
                         help='Path to the compact soft-label TIFF used for validation patch filtering.')
+    parser.add_argument('--manual_tissue_mask_path', type=str, default=None,
+                        help='Path to the manual tissue mask Zarr used when --segmentation_source=manual_mask.')
+    parser.add_argument('--manual_mask_source_level', type=int, default=4,
+                        help='Source pyramid level in the manual tissue mask Zarr. Defaults to 4.')
+    parser.add_argument('--manual_mask_target_level', type=int, default=0,
+                        help='Target pyramid level in the manual tissue mask Zarr. Defaults to 0.')
+    parser.add_argument('--manual_mask_tissue_thr', type=int, default=0,
+                        help='Threshold used to booleanize manual mask values. Defaults to 0.')
     parser.add_argument('--min_high_confidence_proportion', type=float, default=0.5,
                         help='Minimum patch-area proportion that must be covered by the highest-confidence vote count.')
     parser.add_argument('--max_low_confidence_proportion', type=float, default=0.1,
@@ -65,35 +75,49 @@ def process_slide(args):
     # Initialize the WSI
     print(f"Processing slide: {args.slide_path}")
     with load_wsi(slide_path=args.slide_path, lazy_init=False, custom_mpp_keys=args.custom_mpp_keys) as slide:
-        seg_device = "cpu" if args.segmenter == "otsu" else f"cuda:{args.gpu}"
         # Step 1: Tissue Segmentation
         print("Running tissue segmentation...")
-        segmentation_model = segmentation_model_factory(
-            model_name=args.segmenter,
-            confidence_thresh=args.seg_conf_thresh,
-        )
-        if args.remove_artifacts or args.remove_penmarks:
-            artifact_remover_model = segmentation_model_factory(
-                'grandqc_artifact',
-                remove_penmarks_only=args.remove_penmarks and not args.remove_artifacts
+        if args.segmentation_source == "model":
+            seg_device = "cpu" if args.segmenter == "otsu" else f"cuda:{args.gpu}"
+            segmentation_model = segmentation_model_factory(
+                model_name=args.segmenter,
+                confidence_thresh=args.seg_conf_thresh,
             )
-        else:
-            artifact_remover_model = None
+            if args.remove_artifacts or args.remove_penmarks:
+                artifact_remover_model = segmentation_model_factory(
+                    'grandqc_artifact',
+                    remove_penmarks_only=args.remove_penmarks and not args.remove_artifacts
+                )
+            else:
+                artifact_remover_model = None
 
-        slide.segment_tissue(
-            segmentation_model=segmentation_model,
-            target_mag=segmentation_model.target_mag,
-            job_dir=args.job_dir,
-            device=seg_device,
-            holes_are_tissue=not args.remove_holes
-        )
-        # additionally remove artifacts for better segmentation.
-        if artifact_remover_model is not None:
             slide.segment_tissue(
-                segmentation_model=artifact_remover_model,
-                target_mag=artifact_remover_model.target_mag,
-                holes_are_tissue=False,
-                job_dir=args.job_dir
+                segmentation_model=segmentation_model,
+                target_mag=segmentation_model.target_mag,
+                job_dir=args.job_dir,
+                device=seg_device,
+                holes_are_tissue=not args.remove_holes
+            )
+            # additionally remove artifacts for better segmentation.
+            if artifact_remover_model is not None:
+                slide.segment_tissue(
+                    segmentation_model=artifact_remover_model,
+                    target_mag=artifact_remover_model.target_mag,
+                    holes_are_tissue=False,
+                    job_dir=args.job_dir
+                )
+        else:
+            if not args.manual_tissue_mask_path:
+                raise ValueError(
+                    "segmentation_source='manual_mask' requires --manual_tissue_mask_path."
+                )
+            slide.segment_tissue_from_manual_mask(
+                mask_path=args.manual_tissue_mask_path,
+                source_level=args.manual_mask_source_level,
+                target_level=args.manual_mask_target_level,
+                tissue_thr=args.manual_mask_tissue_thr,
+                holes_are_tissue=not args.remove_holes,
+                job_dir=args.job_dir,
             )
         print(f"Tissue segmentation completed. Results saved to {os.path.join(args.job_dir, 'contours_geojson')} and {os.path.join(args.job_dir, 'contours')}")
 

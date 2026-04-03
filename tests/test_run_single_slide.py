@@ -29,6 +29,7 @@ class TestRunSingleSlide(unittest.TestCase):
         args.gpu = 1
         args.slide_path = "/tmp/fake.svs"
         args.job_dir = "/tmp/job"
+        args.segmentation_source = "model"
         args.patch_encoder = "uni_v1"
         args.mag = 20
         args.patch_size = 256
@@ -42,6 +43,10 @@ class TestRunSingleSlide(unittest.TestCase):
         args.batch_size = 4
         args.validation_mode = False
         args.annotation_vote_paths = None
+        args.manual_tissue_mask_path = None
+        args.manual_mask_source_level = 4
+        args.manual_mask_target_level = 0
+        args.manual_mask_tissue_thr = 0
         args.min_high_confidence_proportion = 0.5
         args.max_low_confidence_proportion = 0.1
         return args
@@ -60,6 +65,7 @@ class TestRunSingleSlide(unittest.TestCase):
 
         _, seg_kwargs = slide.segment_tissue.call_args
         self.assertEqual(seg_kwargs["device"], "cpu")
+        slide.segment_tissue_from_manual_mask.assert_not_called()
 
     def test_process_slide_uses_gpu_for_hest(self):
         args = self._base_args("hest")
@@ -75,6 +81,47 @@ class TestRunSingleSlide(unittest.TestCase):
 
         _, seg_kwargs = slide.segment_tissue.call_args
         self.assertEqual(seg_kwargs["device"], "cuda:1")
+        slide.segment_tissue_from_manual_mask.assert_not_called()
+
+    def test_process_slide_manual_mask_requires_explicit_path(self):
+        args = self._base_args("hest")
+        args.segmentation_source = "manual_mask"
+        args.manual_tissue_mask_path = None
+
+        slide = MagicMock()
+        slide.name = "fake"
+        slide.extract_tissue_coords.return_value = "/tmp/job/coords.h5"
+        slide.visualize_coords.return_value = "/tmp/job/viz.jpg"
+
+        with patch("run_single_slide.load_wsi", return_value=_SlideContext(slide)), \
+             patch("run_single_slide.encoder_factory", return_value=MagicMock()):
+            with self.assertRaises(ValueError):
+                single_mod.process_slide(args)
+
+    def test_process_slide_manual_mask_dispatches_with_expected_args(self):
+        args = self._base_args("hest")
+        args.segmentation_source = "manual_mask"
+        args.manual_tissue_mask_path = "/tmp/manual_mask.zarr"
+        args.manual_mask_source_level = 5
+        args.manual_mask_target_level = 0
+        args.manual_mask_tissue_thr = 2
+
+        slide = MagicMock()
+        slide.name = "fake"
+        slide.extract_tissue_coords.return_value = "/tmp/job/coords.h5"
+        slide.visualize_coords.return_value = "/tmp/job/viz.jpg"
+
+        with patch("run_single_slide.load_wsi", return_value=_SlideContext(slide)), \
+             patch("run_single_slide.encoder_factory", return_value=MagicMock()):
+            single_mod.process_slide(args)
+
+        slide.segment_tissue.assert_not_called()
+        _, manual_kwargs = slide.segment_tissue_from_manual_mask.call_args
+        self.assertEqual(manual_kwargs["mask_path"], "/tmp/manual_mask.zarr")
+        self.assertEqual(manual_kwargs["source_level"], 5)
+        self.assertEqual(manual_kwargs["target_level"], 0)
+        self.assertEqual(manual_kwargs["tissue_thr"], 2)
+        self.assertTrue(manual_kwargs["holes_are_tissue"])
 
     def test_process_slide_passes_validation_filter_args(self):
         args = self._base_args("hest")

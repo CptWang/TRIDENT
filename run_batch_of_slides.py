@@ -67,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
                               "This allows processing of datasets organized in hierarchical structures. "
                               "Defaults to False (only top-level slides are included)."))
     # Segmentation arguments 
+    parser.add_argument('--segmentation_source', type=str, default='model',
+                        choices=['model', 'manual_mask'],
+                        help='Segmentation source: model-based segmentation (`model`) or precomputed mask path (`manual_mask`).')
     parser.add_argument('--segmenter', type=str, default='hest', 
                         choices=['hest', 'grandqc', 'otsu'],
                         help='Type of tissue vs background segmenter. Options are HEST, GrandQC, or Otsu.')
@@ -80,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Do you want to run an additional model to remove penmarks?')
     parser.add_argument('--seg_batch_size', type=int, default=None, 
                         help='Batch size for segmentation. Defaults to None (use `batch_size` argument instead).')
+    parser.add_argument('--manual_tissue_mask_column', type=str, default=None,
+                        help='CSV column in --custom_list_of_wsis containing manual tissue mask paths for segmentation_source=manual_mask.')
+    parser.add_argument('--manual_mask_source_level', type=int, default=4,
+                        help='Source pyramid level in the manual tissue mask Zarr. Defaults to 4.')
+    parser.add_argument('--manual_mask_target_level', type=int, default=0,
+                        help='Target pyramid level in the manual tissue mask Zarr. Defaults to 0.')
+    parser.add_argument('--manual_mask_tissue_thr', type=int, default=0,
+                        help='Threshold used to booleanize manual mask values. Defaults to 0.')
     
     # Patching arguments
     parser.add_argument('--mag', type=float, default=20.0,
@@ -171,6 +182,7 @@ def initialize_processor(args: argparse.Namespace) -> Processor:
         custom_mpp_keys=args.custom_mpp_keys,
         custom_list_of_wsis=args.custom_list_of_wsis,
         annotation_vote_column=args.annotation_vote_column,
+        manual_tissue_mask_column=args.manual_tissue_mask_column,
         max_workers=args.max_workers,
         reader_type=args.reader_type,
         search_nested=args.search_nested,
@@ -190,32 +202,51 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
     """
 
     if args.task == 'seg':
-        from trident.segmentation_models.load import segmentation_model_factory
+        if args.segmentation_source == 'model':
+            from trident.segmentation_models.load import segmentation_model_factory
 
-        seg_device = "cpu" if args.segmenter == "otsu" else f"cuda:{args.gpu}"
+            seg_device = "cpu" if args.segmenter == "otsu" else f"cuda:{args.gpu}"
 
-        # instantiate segmentation model and artifact remover if requested by user
-        segmentation_model = segmentation_model_factory(
-            args.segmenter,
-            confidence_thresh=args.seg_conf_thresh,
-        )
-        if args.remove_artifacts or args.remove_penmarks:
-            artifact_remover_model = segmentation_model_factory(
-                'grandqc_artifact',
-                remove_penmarks_only=args.remove_penmarks and not args.remove_artifacts
+            # instantiate segmentation model and artifact remover if requested by user
+            segmentation_model = segmentation_model_factory(
+                args.segmenter,
+                confidence_thresh=args.seg_conf_thresh,
+            )
+            if args.remove_artifacts or args.remove_penmarks:
+                artifact_remover_model = segmentation_model_factory(
+                    'grandqc_artifact',
+                    remove_penmarks_only=args.remove_penmarks and not args.remove_artifacts
+                )
+            else:
+                artifact_remover_model = None
+
+            # run segmentation 
+            processor.run_segmentation_job(
+                segmentation_model=segmentation_model,
+                seg_mag=segmentation_model.target_mag,
+                holes_are_tissue= not args.remove_holes,
+                artifact_remover_model=artifact_remover_model,
+                batch_size=args.seg_batch_size if args.seg_batch_size is not None else args.batch_size,
+                device=seg_device,
+                segmentation_source='model',
             )
         else:
-            artifact_remover_model = None
-
-        # run segmentation 
-        processor.run_segmentation_job(
-            segmentation_model,
-            seg_mag=segmentation_model.target_mag,
-            holes_are_tissue= not args.remove_holes,
-            artifact_remover_model=artifact_remover_model,
-            batch_size=args.seg_batch_size if args.seg_batch_size is not None else args.batch_size,
-            device=seg_device,
-        )
+            if args.custom_list_of_wsis is None:
+                raise ValueError(
+                    "segmentation_source='manual_mask' requires --custom_list_of_wsis with per-slide mask paths."
+                )
+            if not args.manual_tissue_mask_column:
+                raise ValueError(
+                    "segmentation_source='manual_mask' requires --manual_tissue_mask_column."
+                )
+            processor.run_segmentation_job(
+                segmentation_model=None,
+                holes_are_tissue=not args.remove_holes,
+                segmentation_source='manual_mask',
+                manual_mask_source_level=args.manual_mask_source_level,
+                manual_mask_target_level=args.manual_mask_target_level,
+                manual_mask_tissue_thr=args.manual_mask_tissue_thr,
+            )
     elif args.task == 'coords':
         processor.run_patching_job(
             target_magnification=args.mag,
