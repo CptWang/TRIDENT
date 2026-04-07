@@ -111,6 +111,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Minimum patch-area proportion that must be covered by the highest-confidence vote count.')
     parser.add_argument('--max_low_confidence_proportion', type=float, default=0.1,
                         help='Maximum patch-area proportion allowed to contain lower-confidence votes.')
+    parser.add_argument(
+        '--dump_patches', action='store_true', default=False,
+        help='During the coords task, also dump patch images (PNGs) to disk.'
+    )
+    parser.add_argument(
+        '--dump_patches_max', type=int, default=0,
+        help='Max number of patch images to dump per slide (0 = no limit).'
+    )
+    parser.add_argument(
+        '--dump_patches_format', type=str, default="png", choices=["png", "jpg"],
+        help='Patch image format to dump (png or jpg). Defaults to png.'
+    )
+    parser.add_argument(
+        '--dump_patches_jpeg_quality', type=int, default=90,
+        help='JPEG quality (1-100) when --dump_patches_format=jpg. Defaults to 90.'
+    )
     
     # Feature extraction arguments 
     parser.add_argument('--patch_encoder', type=str, default='conch_v15', 
@@ -254,9 +270,13 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             overlap=args.overlap,
             saveto=args.coords_dir,
             min_tissue_proportion=args.min_tissue_proportion,
-            validation_mode=args.validation_mode,
-            min_high_confidence_proportion=args.min_high_confidence_proportion,
-            max_low_confidence_proportion=args.max_low_confidence_proportion,
+            validation_mode=getattr(args, "validation_mode", False),
+            min_high_confidence_proportion=getattr(args, "min_high_confidence_proportion", 0.5),
+            max_low_confidence_proportion=getattr(args, "max_low_confidence_proportion", 0.1),
+            dump_patches=getattr(args, "dump_patches", False),
+            dump_patches_max=getattr(args, "dump_patches_max", 0),
+            dump_patches_format=getattr(args, "dump_patches_format", "png"),
+            dump_patches_jpeg_quality=getattr(args, "dump_patches_jpeg_quality", 90),
         )
     elif args.task == 'feat':
         if args.slide_encoder is None: 
