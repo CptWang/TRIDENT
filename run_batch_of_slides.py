@@ -101,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Absolute overlap for patching in pixels. Defaults to 0.')
     parser.add_argument('--min_tissue_proportion', type=float, default=0., 
                         help='Minimum proportion of the patch under tissue to be kept. Between 0. and 1.0. Defaults to 0.')
+    parser.add_argument('--max_white_proportion', type=float, default=0.9,
+                        help='Maximum proportion of white/empty pixels allowed in a kept patch. Defaults to 0.9.')
     parser.add_argument('--coords_dir', type=str, default=None, 
                         help='Directory to save/restore tissue coordinates.')
     parser.add_argument('--validation_mode', action='store_true', default=False,
@@ -270,6 +272,7 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             overlap=args.overlap,
             saveto=args.coords_dir,
             min_tissue_proportion=args.min_tissue_proportion,
+            max_white_proportion=getattr(args, "max_white_proportion", 0.9),
             validation_mode=getattr(args, "validation_mode", False),
             min_high_confidence_proportion=getattr(args, "min_high_confidence_proportion", 0.5),
             max_low_confidence_proportion=getattr(args, "max_low_confidence_proportion", 0.1),

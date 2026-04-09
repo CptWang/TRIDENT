@@ -374,6 +374,7 @@ class Processor:
         saveto: str | None = None, 
         visualize: bool = True,
         min_tissue_proportion: float = 0.,
+        max_white_proportion: float = 0.9,
         validation_mode: bool = False,
         min_high_confidence_proportion: float = 0.5,
         max_low_confidence_proportion: float = 0.1,
@@ -401,6 +402,8 @@ class Processor:
                 Whether to generate and save visualizations of the patches. Defaults to True.
             min_tissue_proportion: float, optional 
                 Minimum proportion of the patch under tissue to be kept. Defaults to 0. 
+            max_white_proportion (float, optional):
+                Maximum proportion of white/empty pixels allowed in a kept patch. Defaults to 0.9.
             validation_mode (bool, optional):
                 If True, enable annotation-confidence filtering for validation-time patch export.
                 Requires each WSI to expose `annotation_vote_paths`.
@@ -488,6 +491,7 @@ class Processor:
                     save_coords=os.path.join(self.job_dir, saveto),
                     overlap=overlap,
                     min_tissue_proportion=min_tissue_proportion,
+                    max_white_proportion=max_white_proportion,
                     is_validation=validation_mode,
                     annotation_vote_paths=getattr(wsi, "annotation_vote_paths", None),
                     min_high_confidence_proportion=min_high_confidence_proportion,

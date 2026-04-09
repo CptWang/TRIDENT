@@ -550,6 +550,8 @@ def coords_to_h5(
     name,
     overlap,
     extra_attrs: Optional[dict] = None,
+    extra_assets: Optional[dict[str, np.ndarray]] = None,
+    extra_asset_attrs: Optional[dict[str, dict]] = None,
 ):
     """ Save tissue coordinates to .h5 """
     coords_array = np.asarray(coords, dtype=np.int64)
@@ -564,6 +566,8 @@ def coords_to_h5(
 
     # Prepare assets for saving
     assets = {'coords' : coords_array}
+    if extra_assets:
+        assets.update(extra_assets)
     attributes = {
         'patch_size': patch_size, # Reference frame: patch_level
         'patch_size_level0': patch_size * src_mag // target_mag, # Reference frame: level0
@@ -578,10 +582,14 @@ def coords_to_h5(
     if extra_attrs:
         attributes.update(extra_attrs)
 
+    dataset_attributes = {'coords': attributes}
+    if extra_asset_attrs:
+        dataset_attributes.update(extra_asset_attrs)
+
     # Save the assets and attributes to an hdf5 file
     save_h5(save_path,
             assets = assets,
-            attributes = {'coords': attributes},
+            attributes = dataset_attributes,
             mode='w')
 
 

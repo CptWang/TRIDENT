@@ -48,6 +48,8 @@ def parse_arguments():
                         help='Absolute overlap for patching in pixels. Defaults to 0. ')
     parser.add_argument('--batch_size', type=int, default=32, 
                         help='Batch size for feature extraction. Defaults to 32.')
+    parser.add_argument('--max_white_proportion', type=float, default=0.9,
+                        help='Maximum proportion of white/empty pixels allowed in a kept patch. Defaults to 0.9.')
     parser.add_argument('--validation_mode', action='store_true', default=False,
                         help='Apply high-confidence annotation filtering when exporting validation patches.')
     parser.add_argument('--annotation_vote_paths', type=str, default=None,
@@ -146,6 +148,7 @@ def process_slide(args):
             patch_size=args.patch_size,
             save_coords=save_coords,
             overlap=args.overlap,
+            max_white_proportion=getattr(args, "max_white_proportion", 0.9),
             is_validation=args.validation_mode,
             annotation_vote_paths=args.annotation_vote_paths,
             min_high_confidence_proportion=args.min_high_confidence_proportion,

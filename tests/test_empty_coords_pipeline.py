@@ -181,6 +181,7 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
             target_mag=20,
             patch_size=512,
             save_coords=self.tmpdir,
+            max_white_proportion=1.0,
             is_validation=True,
             annotation_vote_paths=vote_path,
             min_high_confidence_proportion=0.5,
@@ -212,6 +213,7 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
             target_mag=20,
             patch_size=512,
             save_coords=self.tmpdir,
+            max_white_proportion=1.0,
             is_validation=True,
             annotation_vote_paths=vote_path,
             min_high_confidence_proportion=0.5,
@@ -224,6 +226,84 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
         self.assertEqual(attrs["annotation_postfilter_patch_count"], 0)
         self.assertFalse(attrs["annotation_background_is_high_confidence"])
 
+    def test_patch_stats_and_white_filter_are_saved_and_mirrored_to_feature_h5(self):
+        img = np.full((1024, 1024, 3), 255, dtype=np.uint8)
+        img[:300, :300, :] = 64
+        Image.fromarray(img).save(self.slide_path)
+
+        wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
+
+        vote_map = np.zeros((1024, 1024), dtype=np.uint8)
+        vote_map[:200, :200] = 3
+        vote_map[:200, 200:400] = 13
+        vote_map[200:400, :200] = 21
+        vote_path = self._write_vote_map(vote_map, "stats_votes.tif")
+
+        coords_path = wsi.extract_tissue_coords(
+            target_mag=20,
+            patch_size=512,
+            save_coords=self.tmpdir,
+            annotation_vote_paths=vote_path,
+        )
+
+        attrs, coords = read_coords(coords_path)
+        np.testing.assert_array_equal(coords, np.array([[0, 0]], dtype=np.int64))
+        self.assertTrue(attrs["annotation_statistics_available"])
+        self.assertEqual(attrs["white_prefilter_patch_count"], 4)
+        self.assertEqual(attrs["white_postfilter_patch_count"], 1)
+        self.assertEqual(attrs["annotation_vote_max_count"], 3)
+        self.assertTrue(attrs["annotation_background_is_high_confidence"])
+
+        with h5py.File(coords_path, "r") as f:
+            self.assertIn("label_hist_raw_compact", f)
+            self.assertIn("label_hist_effective_carcinoma", f)
+            self.assertIn("label_confident_pixel_count", f)
+            self.assertIn("label_low_confidence_pixel_count", f)
+            self.assertIn("patch_area_pixels", f)
+            self.assertIn("white_pixel_fraction", f)
+
+            raw_hist = f["label_hist_raw_compact"][:]
+            effective_hist = f["label_hist_effective_carcinoma"][:]
+            confident_pixels = f["label_confident_pixel_count"][:]
+            low_confidence_pixels = f["label_low_confidence_pixel_count"][:]
+            patch_area_pixels = f["patch_area_pixels"][:]
+            white_fraction = f["white_pixel_fraction"][:]
+
+            np.testing.assert_array_equal(
+                f["label_hist_raw_compact"].attrs["label_values"],
+                np.array([0, 1, 2, 3, 11, 12, 13, 21, 22, 23, 24, 25, 26, 27, 28, 29], dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(
+                raw_hist[:, [0, 3, 6, 7]],
+                np.array([[142144, 40000, 40000, 40000]], dtype=np.uint32),
+            )
+            np.testing.assert_array_equal(
+                effective_hist,
+                np.array([[142144, 0, 40000, 80000]], dtype=np.uint32),
+            )
+            np.testing.assert_array_equal(confident_pixels, np.array([222144], dtype=np.uint32))
+            np.testing.assert_array_equal(low_confidence_pixels, np.array([40000], dtype=np.uint32))
+            np.testing.assert_array_equal(patch_area_pixels, np.array([262144], dtype=np.uint32))
+            self.assertLess(float(white_fraction[0]), 0.9)
+
+        feats_dir = os.path.join(self.tmpdir, "features_with_stats")
+        feats_path = wsi.extract_patch_features(
+            patch_encoder=DummyPatchEncoder(),
+            coords_path=coords_path,
+            save_features=feats_dir,
+            device="cpu",
+            saveas="h5",
+            batch_limit=16,
+        )
+        with h5py.File(feats_path, "r") as f:
+            self.assertIn("label_hist_raw_compact", f)
+            self.assertIn("white_pixel_fraction", f)
+            np.testing.assert_array_equal(f["coords"][:], np.array([[0, 0]], dtype=np.int64))
+            np.testing.assert_array_equal(
+                f["label_hist_effective_carcinoma"][:],
+                np.array([[142144, 0, 40000, 80000]], dtype=np.uint32),
+            )
+
     def test_training_mode_ignores_annotation_confidence_filter(self):
         wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
         vote_map = np.zeros((1024, 1024), dtype=np.uint8)
@@ -234,6 +314,7 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
             target_mag=20,
             patch_size=512,
             save_coords=self.tmpdir,
+            max_white_proportion=1.0,
             is_validation=False,
             annotation_vote_paths=vote_path,
         )
