@@ -14,6 +14,12 @@ from trident.Maintenance import deprecated
 from trident.wsi_objects.WSIFactory import OPENSLIDE_EXTENSIONS, PIL_EXTENSIONS, SDPC_EXTENSIONS, OMEZARR_EXTENSIONS
 
 
+def _is_background_only_marker(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() == "empty"
+
+
 class Processor:
 
     def __init__(
@@ -197,7 +203,9 @@ class Processor:
                 ))
                 if valid_annotation_vote_paths is not None:
                     raw_vote_paths = valid_annotation_vote_paths[wsi_idx]
-                    slide.annotation_vote_paths = raw_vote_paths.strip()
+                    cleaned_vote_path = raw_vote_paths.strip()
+                    slide.annotation_vote_paths = None if _is_background_only_marker(cleaned_vote_path) else (cleaned_vote_path or None)
+                    slide.annotation_background_only = _is_background_only_marker(cleaned_vote_path)
                 if valid_manual_tissue_mask_paths is not None:
                     raw_manual_mask_path = valid_manual_tissue_mask_paths[wsi_idx]
                     slide.manual_tissue_mask_path = raw_manual_mask_path.strip()
@@ -494,6 +502,7 @@ class Processor:
                     max_white_proportion=max_white_proportion,
                     is_validation=validation_mode,
                     annotation_vote_paths=getattr(wsi, "annotation_vote_paths", None),
+                    annotation_background_only=getattr(wsi, "annotation_background_only", False),
                     min_high_confidence_proportion=min_high_confidence_proportion,
                     max_low_confidence_proportion=max_low_confidence_proportion,
                 )

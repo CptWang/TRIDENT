@@ -74,6 +74,36 @@ class TestProcessorManualMask(unittest.TestCase):
                         manual_tissue_mask_column="manual_mask",
                     )
 
+    def test_init_marks_empty_label_rows_as_background_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "wsis.csv")
+            with open(csv_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "wsi,mpp,original_2d_nodo_label\n"
+                    "/tmp/slide.svs,0.5,empty\n"
+                )
+
+            slide = MagicMock(name="slide")
+            with patch.object(
+                processor_module,
+                "collect_valid_slides",
+                return_value=(["/tmp/slide.svs"], ["slide.svs"]),
+            ), patch.object(
+                processor_module,
+                "load_wsi",
+                return_value=_Ctx(slide),
+            ), patch.object(processor_module.os.path, "exists", return_value=False):
+                Processor(
+                    job_dir=tmpdir,
+                    wsi_source="/tmp/wsi",
+                    wsi_ext=[".svs"],
+                    custom_list_of_wsis=csv_path,
+                    annotation_vote_column="original_2d_nodo_label",
+                )
+
+            self.assertIsNone(slide.annotation_vote_paths)
+            self.assertTrue(slide.annotation_background_only)
+
     def _build_processor(self, job_dir: str, wsi: _DummyWSI) -> Processor:
         processor = Processor.__new__(Processor)
         processor.job_dir = job_dir
@@ -148,4 +178,3 @@ class TestProcessorManualMask(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

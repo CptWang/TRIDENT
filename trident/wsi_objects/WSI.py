@@ -612,6 +612,84 @@ class WSI:
         }
         return assets, asset_attrs, coords_attrs
 
+    def _compute_background_only_patch_statistics(
+        self,
+        coords: np.ndarray,
+        patch_size_level0: int,
+    ) -> Tuple[dict[str, np.ndarray], dict[str, dict], dict]:
+        coords_array = np.asarray(coords, dtype=np.int64)
+        if coords_array.size == 0:
+            coords_array = coords_array.reshape(0, 2)
+
+        raw_label_values = self.COMPACT_LABEL_VALUES_FOR_STATS
+        raw_value_to_index = {
+            int(label_value): idx for idx, label_value in enumerate(raw_label_values.tolist())
+        }
+        effective_vote_values = np.asarray([0, 1, 2, 3], dtype=np.uint8)
+
+        raw_hist = np.zeros((len(coords_array), len(raw_label_values)), dtype=np.uint32)
+        effective_hist = np.zeros((len(coords_array), len(effective_vote_values)), dtype=np.uint32)
+        confident_pixel_count = np.zeros((len(coords_array),), dtype=np.uint32)
+        low_confidence_pixel_count = np.zeros((len(coords_array),), dtype=np.uint32)
+        patch_area_pixels = np.zeros((len(coords_array),), dtype=np.uint32)
+
+        for idx, (x, y) in enumerate(coords_array):
+            right = min(int(x) + patch_size_level0, self.width)
+            lower = min(int(y) + patch_size_level0, self.height)
+            if right <= x or lower <= y:
+                continue
+
+            patch_area = (right - int(x)) * (lower - int(y))
+            patch_area_pixels[idx] = patch_area
+            raw_hist[idx, raw_value_to_index[0]] = patch_area
+            effective_hist[idx, 0] = patch_area
+            confident_pixel_count[idx] = patch_area
+
+        assets = {
+            "label_hist_raw_compact": raw_hist,
+            "label_hist_effective_carcinoma": effective_hist,
+            "label_confident_pixel_count": confident_pixel_count,
+            "label_low_confidence_pixel_count": low_confidence_pixel_count,
+            "patch_area_pixels": patch_area_pixels,
+        }
+        asset_attrs = {
+            "label_hist_raw_compact": {
+                "description": "Per-patch raw pixel counts for the compact soft-label codebook.",
+                "label_values": raw_label_values,
+            },
+            "label_hist_effective_carcinoma": {
+                "description": "Per-patch pixel counts after decoding compact soft labels into effective carcinoma vote counts.",
+                "vote_values": effective_vote_values,
+            },
+            "label_confident_pixel_count": {
+                "description": (
+                    "Per-patch count of confident pixels for reviewed-benign slides with no compact label path: "
+                    "all tissue pixels are treated as confident background (label 0)."
+                ),
+            },
+            "label_low_confidence_pixel_count": {
+                "description": (
+                    "Per-patch count of lower-confidence carcinoma pixels for reviewed-benign slides. "
+                    "This is always zero when the compact label path is empty and the slide is marked background-only."
+                ),
+            },
+            "patch_area_pixels": {
+                "description": "Per-patch pixel area measured in level-0 annotation space.",
+            },
+        }
+        coords_attrs = {
+            "annotation_statistics_available": True,
+            "annotation_vote_paths": "",
+            "annotation_vote_interpretation": "reviewed_benign_background_only",
+            "annotation_background_is_high_confidence": True,
+            "annotation_vote_max_count": 0,
+            "annotation_background_only_slide": True,
+            "annotation_confident_definition": (
+                "all tissue pixels are reviewed benign background (label 0) and confident"
+            ),
+        }
+        return assets, asset_attrs, coords_attrs
+
     def _filter_coords_by_annotation_confidence(
         self,
         coords: List[Tuple[int, int]],
@@ -732,6 +810,31 @@ class WSI:
             "annotation_postfilter_patch_count": len(filtered_coords),
         }
         return filtered_coords, metadata, keep_mask
+
+    def _keep_background_only_validation_coords(
+        self,
+        coords: np.ndarray,
+        min_high_confidence_proportion: float,
+        max_low_confidence_proportion: float,
+    ) -> Tuple[np.ndarray, dict, np.ndarray]:
+        coords_array = np.asarray(coords, dtype=np.int64)
+        if coords_array.size == 0:
+            coords_array = coords_array.reshape(0, 2)
+
+        keep_mask = np.ones((len(coords_array),), dtype=bool)
+        metadata = {
+            "validation_mode": True,
+            "annotation_vote_paths": "",
+            "annotation_vote_interpretation": "reviewed_benign_background_only",
+            "annotation_background_is_high_confidence": True,
+            "annotation_vote_max_count": 0,
+            "annotation_background_only_slide": True,
+            "annotation_min_high_confidence_proportion": min_high_confidence_proportion,
+            "annotation_max_low_confidence_proportion": max_low_confidence_proportion,
+            "annotation_prefilter_patch_count": int(len(coords_array)),
+            "annotation_postfilter_patch_count": int(len(coords_array)),
+        }
+        return coords_array, metadata, keep_mask
     
     def _fetch_magnification(self, custom_mpp_keys: Optional[List[str]] = None) -> int:
         """
@@ -1243,6 +1346,7 @@ class WSI:
         max_white_proportion: float = 0.9,
         is_validation: bool = False,
         annotation_vote_paths: Optional[Union[str, List[str]]] = None,
+        annotation_background_only: bool = False,
         min_high_confidence_proportion: float = 0.5,
         max_low_confidence_proportion: float = 0.1,
     ) -> str:
@@ -1270,6 +1374,10 @@ class WSI:
         annotation_vote_paths : Optional[Union[str, List[str]]], optional
             Path to the compact soft-label TIFF used to score annotation agreement.
             Required when `is_validation=True`.
+        annotation_background_only : bool, optional
+            If True, treat the entire slide as reviewed-benign confident background when no compact
+            soft-label TIFF path is provided. Intended for manifest rows where pathologists completed
+            review and the matching label column is empty because the tissue was assessed as benign.
         min_high_confidence_proportion : float, optional
             Minimum proportion of the patch area that must be covered by the highest available vote count.
             Defaults to 0.5.
@@ -1317,10 +1425,21 @@ class WSI:
         extra_asset_attrs.update(white_asset_attrs)
         extra_attrs.update(white_attrs)
 
-        if annotation_vote_paths is not None:
+        normalized_vote_paths = self._normalize_annotation_vote_paths(annotation_vote_paths)
+        has_annotation_vote_map = len(normalized_vote_paths) > 0
+
+        if has_annotation_vote_map:
             annotation_assets, annotation_asset_attrs, annotation_attrs = self._compute_annotation_patch_statistics(
                 coords=coords_to_keep,
-                annotation_vote_paths=annotation_vote_paths,
+                annotation_vote_paths=normalized_vote_paths,
+                patch_size_level0=patcher.patch_size_src,
+            )
+            extra_assets.update(annotation_assets)
+            extra_asset_attrs.update(annotation_asset_attrs)
+            extra_attrs.update(annotation_attrs)
+        elif annotation_background_only:
+            annotation_assets, annotation_asset_attrs, annotation_attrs = self._compute_background_only_patch_statistics(
+                coords=coords_to_keep,
                 patch_size_level0=patcher.patch_size_src,
             )
             extra_assets.update(annotation_assets)
@@ -1328,14 +1447,21 @@ class WSI:
             extra_attrs.update(annotation_attrs)
 
         if is_validation:
-            coords_list = [tuple(xy) for xy in coords_to_keep.tolist()]
-            coords_to_keep_filtered, validation_attrs, validation_keep_mask = self._filter_coords_by_annotation_confidence(
-                coords=coords_list,
-                annotation_vote_paths=annotation_vote_paths,
-                patch_size_level0=patcher.patch_size_src,
-                min_high_confidence_proportion=min_high_confidence_proportion,
-                max_low_confidence_proportion=max_low_confidence_proportion,
-            )
+            if annotation_background_only and not has_annotation_vote_map:
+                coords_to_keep_filtered, validation_attrs, validation_keep_mask = self._keep_background_only_validation_coords(
+                    coords=coords_to_keep,
+                    min_high_confidence_proportion=min_high_confidence_proportion,
+                    max_low_confidence_proportion=max_low_confidence_proportion,
+                )
+            else:
+                coords_list = [tuple(xy) for xy in coords_to_keep.tolist()]
+                coords_to_keep_filtered, validation_attrs, validation_keep_mask = self._filter_coords_by_annotation_confidence(
+                    coords=coords_list,
+                    annotation_vote_paths=normalized_vote_paths if has_annotation_vote_map else annotation_vote_paths,
+                    patch_size_level0=patcher.patch_size_src,
+                    min_high_confidence_proportion=min_high_confidence_proportion,
+                    max_low_confidence_proportion=max_low_confidence_proportion,
+                )
             coords_to_keep = np.asarray(coords_to_keep_filtered, dtype=np.int64)
             if coords_to_keep.size == 0:
                 coords_to_keep = coords_to_keep.reshape(0, 2)

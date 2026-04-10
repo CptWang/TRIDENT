@@ -226,6 +226,70 @@ class TestEmptyCoordsPipeline(unittest.TestCase):
         self.assertEqual(attrs["annotation_postfilter_patch_count"], 0)
         self.assertFalse(attrs["annotation_background_is_high_confidence"])
 
+    def test_reviewed_benign_background_only_slide_saves_confident_background_stats(self):
+        wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
+
+        coords_path = wsi.extract_tissue_coords(
+            target_mag=20,
+            patch_size=512,
+            save_coords=self.tmpdir,
+            max_white_proportion=1.0,
+            annotation_background_only=True,
+        )
+
+        attrs, coords = read_coords(coords_path)
+        np.testing.assert_array_equal(
+            coords,
+            np.array([[0, 0], [512, 0], [0, 512], [512, 512]], dtype=np.int64),
+        )
+        self.assertTrue(attrs["annotation_statistics_available"])
+        self.assertTrue(attrs["annotation_background_is_high_confidence"])
+        self.assertTrue(attrs["annotation_background_only_slide"])
+        self.assertEqual(attrs["annotation_vote_max_count"], 0)
+        self.assertEqual(attrs["annotation_vote_interpretation"], "reviewed_benign_background_only")
+
+        with h5py.File(coords_path, "r") as f:
+            raw_hist = f["label_hist_raw_compact"][:]
+            effective_hist = f["label_hist_effective_carcinoma"][:]
+            confident_pixels = f["label_confident_pixel_count"][:]
+            low_confidence_pixels = f["label_low_confidence_pixel_count"][:]
+            patch_area_pixels = f["patch_area_pixels"][:]
+
+            np.testing.assert_array_equal(raw_hist[:, 0], np.full((4,), 262144, dtype=np.uint32))
+            np.testing.assert_array_equal(raw_hist[:, 1:], np.zeros((4, 15), dtype=np.uint32))
+            np.testing.assert_array_equal(
+                effective_hist,
+                np.tile(np.array([[262144, 0, 0, 0]], dtype=np.uint32), (4, 1)),
+            )
+            np.testing.assert_array_equal(confident_pixels, np.full((4,), 262144, dtype=np.uint32))
+            np.testing.assert_array_equal(low_confidence_pixels, np.zeros((4,), dtype=np.uint32))
+            np.testing.assert_array_equal(patch_area_pixels, np.full((4,), 262144, dtype=np.uint32))
+
+    def test_validation_confidence_filter_keeps_reviewed_benign_background_only_slides(self):
+        wsi = ImageWSI(slide_path=self.slide_path, mpp=0.5, lazy_init=False)
+
+        coords_path = wsi.extract_tissue_coords(
+            target_mag=20,
+            patch_size=512,
+            save_coords=self.tmpdir,
+            max_white_proportion=1.0,
+            is_validation=True,
+            annotation_background_only=True,
+            min_high_confidence_proportion=0.5,
+            max_low_confidence_proportion=0.1,
+        )
+
+        attrs, coords = read_coords(coords_path)
+        np.testing.assert_array_equal(
+            coords,
+            np.array([[0, 0], [512, 0], [0, 512], [512, 512]], dtype=np.int64),
+        )
+        self.assertTrue(attrs["annotation_background_is_high_confidence"])
+        self.assertTrue(attrs["annotation_background_only_slide"])
+        self.assertEqual(attrs["annotation_vote_max_count"], 0)
+        self.assertEqual(attrs["annotation_prefilter_patch_count"], 4)
+        self.assertEqual(attrs["annotation_postfilter_patch_count"], 4)
+
     def test_patch_stats_and_white_filter_are_saved_and_mirrored_to_feature_h5(self):
         img = np.full((1024, 1024, 3), 255, dtype=np.uint8)
         img[:300, :300, :] = 64
