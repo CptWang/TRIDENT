@@ -282,6 +282,51 @@ class WSI:
 
         return int(np.argmin(src_shape))
 
+    @staticmethod
+    def _resolve_zarr_level_key(
+        requested_level: int,
+        array_keys: List[str],
+        mask_path: str,
+        level_role: str,
+        allow_fallback: bool,
+    ) -> str:
+        requested_key = str(requested_level)
+        if requested_key in array_keys:
+            return requested_key
+
+        available_levels = sorted(
+            array_keys,
+            key=lambda key: int(key) if str(key).isdigit() else str(key),
+        )
+        if not allow_fallback:
+            raise ValueError(
+                f"{level_role}={requested_level} not found in {mask_path}. "
+                f"Available levels: {available_levels}"
+            )
+
+        numeric_levels = [int(key) for key in array_keys if str(key).isdigit()]
+        if numeric_levels:
+            fallback_level = min(
+                numeric_levels,
+                key=lambda level: (abs(level - requested_level), level),
+            )
+            warnings.warn(
+                f"{level_role}={requested_level} not found in {mask_path}. "
+                f"Falling back to available level {fallback_level}. "
+                f"Available levels: {available_levels}",
+                UserWarning,
+            )
+            return str(fallback_level)
+
+        fallback_key = available_levels[0]
+        warnings.warn(
+            f"{level_role}={requested_level} not found in {mask_path}. "
+            f"Falling back to available level '{fallback_key}'. "
+            f"Available levels: {available_levels}",
+            UserWarning,
+        )
+        return fallback_key
+
     @classmethod
     def _reconstruct_manual_mask_2d_from_zarr(
         cls,
@@ -303,14 +348,21 @@ class WSI:
                 "Input mask path must point to a pyramid Zarr group containing level arrays ('0', '1', ...)."
             )
 
-        source_key = str(source_level)
-        target_key = str(target_level)
         array_keys = list(root.array_keys())
-        available_levels = sorted(array_keys, key=lambda key: int(key) if str(key).isdigit() else str(key))
-        if source_key not in array_keys:
-            raise ValueError(f"source_level={source_level} not found in {mask_path}. Available levels: {available_levels}")
-        if target_key not in array_keys:
-            raise ValueError(f"target_level={target_level} not found in {mask_path}. Available levels: {available_levels}")
+        source_key = cls._resolve_zarr_level_key(
+            requested_level=source_level,
+            array_keys=array_keys,
+            mask_path=mask_path,
+            level_role="source_level",
+            allow_fallback=True,
+        )
+        target_key = cls._resolve_zarr_level_key(
+            requested_level=target_level,
+            array_keys=array_keys,
+            mask_path=mask_path,
+            level_role="target_level",
+            allow_fallback=False,
+        )
 
         source_arr = root[source_key]
         target_arr = root[target_key]

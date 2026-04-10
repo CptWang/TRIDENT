@@ -72,6 +72,25 @@ class _DummyManualMaskWSI(WSI):
 
 
 class TestManualMaskReconstruction(unittest.TestCase):
+    def test_reconstruct_manual_mask_falls_back_to_nearest_available_source_level(self):
+        source = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        target = np.zeros((4, 4), dtype=np.uint8)
+        root = _FakeZarrGroup({"0": _FakeZarrArray(source)})
+
+        fake_zarr = _fake_zarr_module(root)
+        with patch.dict(sys.modules, {"zarr": fake_zarr}):
+            with self.assertWarnsRegex(UserWarning, r"source_level=4.*Falling back to available level 0"):
+                mask = WSI._reconstruct_manual_mask_2d_from_zarr(
+                    mask_path="/tmp/unused.zarr",
+                    source_level=4,
+                    target_level=0,
+                    tissue_thr=0,
+                )
+
+        expected = np.array([[False, True], [True, False]])
+        self.assertEqual(mask.shape, (2, 2))
+        self.assertTrue(np.array_equal(mask, expected))
+
     def test_reconstruct_manual_mask_from_2d_source_resizes_nearest(self):
         source = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         target = np.zeros((4, 4), dtype=np.uint8)
@@ -169,4 +188,3 @@ class TestManualMaskSegmentationAPI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
