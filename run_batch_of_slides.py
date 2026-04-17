@@ -59,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help='Custom keys used to store the resolution as MPP (micron per pixel) in your list of whole-slide image.')
     parser.add_argument('--custom_list_of_wsis', type=str, default=None,
                     help='Custom list of WSIs specified in a csv file.')
+    parser.add_argument(
+        '--wsi_name_column',
+        type=str,
+        default=None,
+        help=(
+            "Optional CSV column in --custom_list_of_wsis used as the per-slide output name. "
+            "When set, values must be non-empty and unique."
+        ),
+    )
     parser.add_argument('--reader_type', type=str, choices=['openslide', 'image', 'cucim', 'sdpc', 'omezarr'], default=None,
                     help='Force the use of a specific WSI image reader. Options are ["openslide", "image", "cucim", "sdpc", "omezarr"]. Defaults to None (auto-determine which reader to use).')
     parser.add_argument("--search_nested", action="store_true",
@@ -199,6 +208,7 @@ def initialize_processor(args: argparse.Namespace) -> Processor:
         skip_errors=args.skip_errors,
         custom_mpp_keys=args.custom_mpp_keys,
         custom_list_of_wsis=args.custom_list_of_wsis,
+        wsi_name_column=args.wsi_name_column,
         annotation_vote_column=args.annotation_vote_column,
         manual_tissue_mask_column=args.manual_tissue_mask_column,
         max_workers=args.max_workers,

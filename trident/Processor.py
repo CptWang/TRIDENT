@@ -32,6 +32,7 @@ class Processor:
         skip_errors: bool = False,
         custom_mpp_keys: Optional[List[str]] = None,
         custom_list_of_wsis: Optional[str] = None,
+        wsi_name_column: Optional[str] = None,
         annotation_vote_column: Optional[str] = None,
         manual_tissue_mask_column: Optional[str] = None,
         max_workers: Optional[int] = None,
@@ -78,6 +79,9 @@ class Processor:
                 these slides will be considered for processing. Defaults to None, which means all 
                 slides matching the wsi_ext extensions will be processed.
                 Note: If `custom_list_of_wsis` is provided, any names that do not match the available slides will be ignored, and a warning will be printed.
+            wsi_name_column (str, optional):
+                Optional CSV column in `custom_list_of_wsis` used as the stable per-slide output name.
+                When provided, values must be non-empty and unique.
             annotation_vote_column (str, optional):
                 Optional CSV column containing the compact soft-label TIFF path.
                 When provided, that path is attached to each WSI and can be used for validation-only patch filtering.
@@ -147,32 +151,63 @@ class Processor:
         # === Extract mpp column if provided ===
         if custom_list_of_wsis is not None:
             wsi_df = pd.read_csv(custom_list_of_wsis)
+            if "wsi" not in wsi_df.columns:
+                raise ValueError("CSV must contain a column named 'wsi'.")
+
+            # Keep per-row metadata aligned with collect_valid_slides(), which drops rows
+            # where 'wsi' is missing before existence checks.
+            wsi_df_effective = wsi_df[wsi_df["wsi"].notna()].copy()
+
             valid_mpps = (
-                wsi_df['mpp'].dropna().tolist()
-                if 'mpp' in wsi_df.columns else None
+                wsi_df_effective["mpp"].tolist()
+                if "mpp" in wsi_df_effective.columns
+                else None
             )
+            if wsi_name_column is not None:
+                if wsi_name_column not in wsi_df_effective.columns:
+                    raise ValueError(
+                        f"CSV must contain WSI name column '{wsi_name_column}'."
+                    )
+                raw_names = wsi_df_effective[wsi_name_column].fillna("").astype(str).str.strip()
+                empty_name_mask = raw_names == ""
+                if bool(empty_name_mask.any()):
+                    empty_rows = (wsi_df_effective.index[empty_name_mask] + 2).tolist()
+                    raise ValueError(
+                        f"CSV column '{wsi_name_column}' has empty values at rows {empty_rows[:10]}."
+                    )
+                duplicate_name_mask = raw_names.duplicated(keep=False)
+                if bool(duplicate_name_mask.any()):
+                    duplicate_names = sorted(set(raw_names[duplicate_name_mask].tolist()))
+                    raise ValueError(
+                        "CSV column "
+                        f"'{wsi_name_column}' must be unique. Duplicate values: {duplicate_names[:10]}"
+                    )
+                valid_wsi_names = raw_names.tolist()
+            else:
+                valid_wsi_names = None
             if annotation_vote_column is not None:
-                if annotation_vote_column not in wsi_df.columns:
+                if annotation_vote_column not in wsi_df_effective.columns:
                     raise ValueError(
                         f"CSV must contain annotation vote column '{annotation_vote_column}'."
                     )
                 valid_annotation_vote_paths = (
-                    wsi_df[annotation_vote_column].fillna("").astype(str).tolist()
+                    wsi_df_effective[annotation_vote_column].fillna("").astype(str).tolist()
                 )
             else:
                 valid_annotation_vote_paths = None
             if manual_tissue_mask_column is not None:
-                if manual_tissue_mask_column not in wsi_df.columns:
+                if manual_tissue_mask_column not in wsi_df_effective.columns:
                     raise ValueError(
                         f"CSV must contain manual tissue mask column '{manual_tissue_mask_column}'."
                     )
                 valid_manual_tissue_mask_paths = (
-                    wsi_df[manual_tissue_mask_column].fillna("").astype(str).tolist()
+                    wsi_df_effective[manual_tissue_mask_column].fillna("").astype(str).tolist()
                 )
             else:
                 valid_manual_tissue_mask_paths = None
         else:
             valid_mpps = None
+            valid_wsi_names = None
             valid_annotation_vote_paths = None
             valid_manual_tissue_mask_paths = None
 
@@ -183,7 +218,11 @@ class Processor:
         stack = ExitStack()
         try:
             for wsi_idx, abs_path in enumerate(full_paths):
-                name = os.path.basename(abs_path)
+                name = (
+                    valid_wsi_names[wsi_idx]
+                    if valid_wsi_names is not None
+                    else os.path.basename(abs_path)
+                )
                 tissue_seg_path = os.path.join(
                     self.job_dir, 'contours_geojson',
                     f'{splitext(name)[0]}.geojson'
@@ -191,12 +230,18 @@ class Processor:
                 if not os.path.exists(tissue_seg_path):
                     tissue_seg_path = None
 
+                mpp_value = None
+                if valid_mpps is not None:
+                    raw_mpp = valid_mpps[wsi_idx]
+                    if not pd.isna(raw_mpp):
+                        mpp_value = float(raw_mpp)
+
                 slide = stack.enter_context(load_wsi(
                     slide_path=abs_path,
                     name=name,
                     tissue_seg_path=tissue_seg_path,
                     custom_mpp_keys=self.custom_mpp_keys,
-                    mpp=valid_mpps[wsi_idx] if valid_mpps is not None else None,
+                    mpp=mpp_value,
                     max_workers=self.max_workers,
                     reader_type=reader_type,
                     lazy_init=True,
