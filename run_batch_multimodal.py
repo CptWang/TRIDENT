@@ -79,6 +79,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
         help="Which modality flow to run.",
     )
+    parser.add_argument(
+        "--nodo-job-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory containing NODO outputs. "
+            "Useful for --modality odo to reuse precomputed NODO coords from another run. "
+            "Defaults to <job_dir>/NODO."
+        ),
+    )
     parser.add_argument("--wsi_nodo_column", type=str, default="wsi_nodo")
     parser.add_argument("--wsi_odo_column", type=str, default="wsi_odo")
     parser.add_argument("--sample_id_column", type=str, default="sample_id")
@@ -783,22 +793,27 @@ def main(argv: list[str] | None = None) -> int:
         validate_wsi_paths(combined_df, args.wsi_odo_column, combined_manifest_csv)
 
     job_root = Path(args.job_dir)
-    nodo_job_dir = job_root / "NODO"
+    nodo_job_dir = (
+        Path(str(args.nodo_job_dir).strip())
+        if args.nodo_job_dir is not None and str(args.nodo_job_dir).strip()
+        else (job_root / "NODO")
+    )
     odo_job_dir = job_root / "ODO"
     visual_confirmation_dir = job_root / "visual_confirmation"
-    nodo_job_dir.mkdir(parents=True, exist_ok=True)
-    odo_job_dir.mkdir(parents=True, exist_ok=True)
-
-    nodo_manifest_csv = nodo_job_dir / "manifest_trident_nodo_multimodal.csv"
-    create_modality_manifest(
-        combined_df=combined_df,
-        sample_ids=sample_ids,
-        wsi_column=args.wsi_nodo_column,
-        mpp=float(args.nodo_mpp),
-        out_csv=nodo_manifest_csv,
-    )
+    if args.modality in ("nodo", "both"):
+        nodo_job_dir.mkdir(parents=True, exist_ok=True)
+    if args.modality in ("odo", "both"):
+        odo_job_dir.mkdir(parents=True, exist_ok=True)
 
     if args.modality in ("nodo", "both"):
+        nodo_manifest_csv = nodo_job_dir / "manifest_trident_nodo_multimodal.csv"
+        create_modality_manifest(
+            combined_df=combined_df,
+            sample_ids=sample_ids,
+            wsi_column=args.wsi_nodo_column,
+            mpp=float(args.nodo_mpp),
+            out_csv=nodo_manifest_csv,
+        )
         nodo_args = deepcopy(args)
         nodo_args.job_dir = str(nodo_job_dir)
         nodo_args.custom_list_of_wsis = str(nodo_manifest_csv)
@@ -811,7 +826,8 @@ def main(argv: list[str] | None = None) -> int:
         if not nodo_coords_patches_dir.exists():
             raise FileNotFoundError(
                 "NODO coords were not found for paired mapping. Expected directory: "
-                f"{nodo_coords_patches_dir}. Run NODO coords first (or run --modality both with NODO coords available)."
+                f"{nodo_coords_patches_dir}. Run NODO coords first, set --nodo-job-dir to an existing "
+                "NODO output directory, or run --modality both."
             )
 
         odo_profile_root = odo_job_dir / coords_profile
