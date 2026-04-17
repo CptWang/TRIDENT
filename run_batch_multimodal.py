@@ -224,6 +224,7 @@ def read_coords_h5(path: Path) -> np.ndarray:
 def build_nodo_patch_manifest_from_coords(
     combined_df: pd.DataFrame,
     sample_col: str,
+    wsi_nodo_col: str,
     nodo_patches_dir: Path,
     out_csv: Path,
 ) -> dict[str, int]:
@@ -241,10 +242,32 @@ def build_nodo_patch_manifest_from_coords(
 
         for _, row in combined_df.iterrows():
             sample_id = str(row[sample_col]).strip()
-            coords_h5 = nodo_patches_dir / f"{sample_id}_patches.h5"
-            if not coords_h5.exists():
+            wsi_nodo = str(row.get(wsi_nodo_col, "")).strip()
+            wsi_nodo_name = Path(wsi_nodo).name if wsi_nodo else ""
+            wsi_nodo_stem = wsi_nodo_name
+            if wsi_nodo_stem.lower().endswith(".ome.zarr"):
+                wsi_nodo_stem = wsi_nodo_stem[: -len(".ome.zarr")]
+            elif wsi_nodo_stem.lower().endswith(".zarr"):
+                wsi_nodo_stem = wsi_nodo_stem[: -len(".zarr")]
+            else:
+                wsi_nodo_stem = Path(wsi_nodo_stem).stem if wsi_nodo_stem else ""
+
+            candidate_ids: list[str] = []
+            for candidate in [sample_id, wsi_nodo_stem]:
+                text = str(candidate).strip()
+                if text and text not in candidate_ids:
+                    candidate_ids.append(text)
+
+            coords_h5 = None
+            for candidate in candidate_ids:
+                candidate_path = nodo_patches_dir / f"{candidate}_patches.h5"
+                if candidate_path.exists():
+                    coords_h5 = candidate_path
+                    break
+            if coords_h5 is None:
+                tried = [str(nodo_patches_dir / f"{candidate}_patches.h5") for candidate in candidate_ids]
                 raise FileNotFoundError(
-                    f"Missing NODO coords for sample '{sample_id}': expected {coords_h5}"
+                    f"Missing NODO coords for sample '{sample_id}'. Tried: {tried}"
                 )
             coords = read_coords_h5(coords_h5)
             counts[sample_id] = int(coords.shape[0])
@@ -835,6 +858,7 @@ def main(argv: list[str] | None = None) -> int:
         nodo_counts = build_nodo_patch_manifest_from_coords(
             combined_df=combined_df,
             sample_col=args.sample_id_column,
+            wsi_nodo_col=args.wsi_nodo_column,
             nodo_patches_dir=nodo_coords_patches_dir,
             out_csv=patch_manifest_csv,
         )
