@@ -136,6 +136,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow paired-mapping script to continue on sample errors.",
     )
+    parser.add_argument(
+        "--pairing_auto_rescue_x_shift",
+        action="store_true",
+        help=(
+            "After paired ODO mapping, apply an opt-in per-sample constant horizontal shift when "
+            "that is sufficient to bring out-of-bounds mapped patches back in frame."
+        ),
+    )
 
     parser.add_argument("--qc_num_slides", type=int, default=5)
     parser.add_argument("--qc_total_patches", type=int, default=30)
@@ -339,6 +347,8 @@ def run_paired_mapping(
         cmd.append("--disable-elastic")
     if args.pairing_allow_missing:
         cmd.append("--allow-missing")
+    if args.pairing_auto_rescue_x_shift:
+        cmd.append("--auto-rescue-constant-x-shift")
 
     subprocess.run(cmd, check=True)
 
