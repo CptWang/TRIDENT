@@ -140,8 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--pairing_auto_rescue_x_shift",
         action="store_true",
         help=(
-            "After paired ODO mapping, apply an opt-in per-sample constant horizontal shift when "
-            "that is sufficient to bring out-of-bounds mapped patches back in frame."
+            "Enable paired-mapping auto-rescue: keep partially out-of-frame ODO patches and "
+            "white-fill the missing region during extraction."
         ),
     )
 
@@ -514,29 +514,67 @@ def extract_patch(path: Path, x: int, y: int, patch_size: int) -> np.ndarray:
     if patch_size <= 0:
         raise ValueError(f"patch_size must be > 0, got {patch_size}")
 
+    x = int(x)
+    y = int(y)
+    patch_size = int(patch_size)
+    padded = np.full((patch_size, patch_size, 3), 255, dtype=np.uint8)
+
     if ".zarr" in str(path):
         arr = open_zarr_array(path)
         shape = tuple(int(v) for v in arr.shape)
+
         if len(shape) == 2:
-            patch = np.asarray(arr[y : y + patch_size, x : x + patch_size])
+            h, w = int(shape[0]), int(shape[1])
+            x0 = max(0, x)
+            y0 = max(0, y)
+            x1 = min(w, x + patch_size)
+            y1 = min(h, y + patch_size)
+            if x1 <= x0 or y1 <= y0:
+                return padded
+            patch = np.asarray(arr[y0:y1, x0:x1])
+            patch_rgb = to_rgb_uint8(patch)
         elif len(shape) == 3 and shape[0] <= 4 and shape[1] > 4 and shape[2] > 4:
-            patch = np.asarray(arr[:, y : y + patch_size, x : x + patch_size])
+            c, h, w = int(shape[0]), int(shape[1]), int(shape[2])
+            _ = c  # channel count kept for clarity
+            x0 = max(0, x)
+            y0 = max(0, y)
+            x1 = min(w, x + patch_size)
+            y1 = min(h, y + patch_size)
+            if x1 <= x0 or y1 <= y0:
+                return padded
+            patch = np.asarray(arr[:, y0:y1, x0:x1])
+            patch_rgb = to_rgb_uint8(patch)
         elif len(shape) == 3:
-            patch = np.asarray(arr[y : y + patch_size, x : x + patch_size, :])
+            h, w = int(shape[0]), int(shape[1])
+            x0 = max(0, x)
+            y0 = max(0, y)
+            x1 = min(w, x + patch_size)
+            y1 = min(h, y + patch_size)
+            if x1 <= x0 or y1 <= y0:
+                return padded
+            patch = np.asarray(arr[y0:y1, x0:x1, :])
+            patch_rgb = to_rgb_uint8(patch)
         else:
             raise ValueError(f"Unsupported zarr shape for patch extraction: {shape}")
-        patch_rgb = to_rgb_uint8(patch)
     else:
         with Image.open(path) as img:
             img = img.convert("RGB")
-            patch_rgb = np.asarray(img.crop((x, y, x + patch_size, y + patch_size)))
+            w, h = img.size
+            x0 = max(0, x)
+            y0 = max(0, y)
+            x1 = min(w, x + patch_size)
+            y1 = min(h, y + patch_size)
+            if x1 <= x0 or y1 <= y0:
+                return padded
+            patch_rgb = np.asarray(img.crop((x0, y0, x1, y1)))
 
-    h, w = patch_rgb.shape[:2]
-    if h == patch_size and w == patch_size:
-        return patch_rgb
-
-    padded = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
-    padded[:h, :w] = patch_rgb
+    h, w = int(patch_rgb.shape[0]), int(patch_rgb.shape[1])
+    dx = max(0, -x)
+    dy = max(0, -y)
+    copy_h = min(h, patch_size - dy)
+    copy_w = min(w, patch_size - dx)
+    if copy_h > 0 and copy_w > 0:
+        padded[dy : dy + copy_h, dx : dx + copy_w] = patch_rgb[:copy_h, :copy_w]
     return padded
 
 
@@ -544,9 +582,11 @@ def draw_indexed_boxes(
     thumb_rgb: np.ndarray,
     orig_size: tuple[int, int],
     boxes: list[tuple[int, int, int, int]],
+    starred_indices: set[int] | None = None,
 ) -> np.ndarray:
     image = Image.fromarray(thumb_rgb)
     draw = ImageDraw.Draw(image)
+    starred = starred_indices or set()
 
     orig_w, orig_h = orig_size
     thumb_w, thumb_h = image.size
@@ -579,6 +619,12 @@ def draw_indexed_boxes(
         draw.rectangle([lx0, ly0, lx1, ly1], fill=color)
         draw.text((lx0 + text_pad, ly0 + text_pad), label, fill="white")
 
+        if global_idx in starred:
+            star_label = "*"
+            sx0 = max(0, x1 - thickness * 2)
+            sy0 = max(0, y0 + thickness)
+            draw.text((sx0, sy0), star_label, fill="#ffd60a")
+
     return np.asarray(image)
 
 
@@ -590,6 +636,18 @@ def to_int_or_none(value: Any) -> int | None:
     if not np.isfinite(v):
         return None
     return int(round(v))
+
+
+def row_is_white_fill_rescued(row: Any) -> bool:
+    if isinstance(row, dict):
+        getter = row.get
+    else:
+        getter = lambda key, default=None: row[key] if key in row else default
+    for key in ("auto_rescue_white_fill", "would_fail_without_auto_rescue"):
+        value = getter(key, None)
+        if value is not None and parse_bool_like(value):
+            return True
+    return False
 
 
 def draw_outline_boxes(
@@ -759,6 +817,7 @@ def create_visual_confirmation(
 
         src_boxes: list[tuple[int, int, int, int]] = []
         tgt_boxes: list[tuple[int, int, int, int]] = []
+        starred_indices: set[int] = set()
         tiles: list[Image.Image] = []
 
         for i, row in sampled.iterrows():
@@ -769,9 +828,12 @@ def create_visual_confirmation(
             target_y = int(round(float(row["mapped_y"])))
             source_patch_size = int(round(float(row["source_patch_size"])))
             target_patch_size = int(round(float(row["target_patch_size"])))
+            rescued = row_is_white_fill_rescued(row)
 
             src_boxes.append((source_x, source_y, source_patch_size, global_idx))
             tgt_boxes.append((target_x, target_y, target_patch_size, global_idx))
+            if rescued:
+                starred_indices.add(global_idx)
 
             source_patch = extract_patch(source_image, source_x, source_y, source_patch_size)
             target_patch = extract_patch(target_image, target_x, target_y, target_patch_size)
@@ -789,11 +851,22 @@ def create_visual_confirmation(
                     "target_y": target_y,
                     "source_patch_size": source_patch_size,
                     "target_patch_size": target_patch_size,
+                    "white_fill_rescued": bool(rescued),
                 }
             )
 
-        source_overlay = draw_indexed_boxes(source_thumb, source_orig, src_boxes)
-        target_overlay = draw_indexed_boxes(target_thumb, target_orig, tgt_boxes)
+        source_overlay = draw_indexed_boxes(
+            source_thumb,
+            source_orig,
+            src_boxes,
+            starred_indices=starred_indices,
+        )
+        target_overlay = draw_indexed_boxes(
+            target_thumb,
+            target_orig,
+            tgt_boxes,
+            starred_indices=starred_indices,
+        )
         source_img = Image.fromarray(source_overlay)
         target_img = Image.fromarray(target_overlay)
 
@@ -817,7 +890,7 @@ def create_visual_confirmation(
         draw = ImageDraw.Draw(panel)
         draw.text(
             (8, 8),
-            f"sample={sample_id} | selected_patches={len(tiles)}",
+            f"sample={sample_id} | selected_patches={len(tiles)} | starred_white_fill={len(starred_indices)}",
             fill="black",
         )
         panel.paste(top, (0, header_h))
@@ -838,6 +911,166 @@ def create_visual_confirmation(
     pd.DataFrame(selected_records).to_csv(selected_csv, index=False)
     pd.DataFrame(panel_records).to_csv(panels_csv, index=False)
     return total_selected
+
+
+def create_auto_rescue_visual_confirmation(
+    mapped_csv: Path,
+    output_dir: Path,
+    thumb_max_side: int = 1200,
+) -> int:
+    if not mapped_csv.exists():
+        raise FileNotFoundError(f"Mapped CSV not found: {mapped_csv}")
+
+    df = pd.read_csv(mapped_csv)
+    required = [
+        "sample_id",
+        "source_x",
+        "source_y",
+        "mapped_x",
+        "mapped_y",
+        "source_image_path",
+        "target_image_path",
+        "source_patch_size",
+        "target_patch_size",
+        "is_valid",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Mapped CSV missing columns for auto-rescue visualization: {missing}")
+
+    rescue_mask = df.apply(row_is_white_fill_rescued, axis=1)
+    rescued = df[rescue_mask & df["is_valid"].map(parse_bool_like)].copy()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    panels_dir = output_dir / "panels"
+    panels_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_records: list[dict[str, Any]] = []
+    panel_records: list[dict[str, Any]] = []
+
+    if rescued.empty:
+        pd.DataFrame([]).to_csv(output_dir / "auto_rescue_selected_patches.csv", index=False)
+        pd.DataFrame([]).to_csv(output_dir / "auto_rescue_panels_index.csv", index=False)
+        return 0
+
+    grouped = [(str(sample_id), group.reset_index(drop=True)) for sample_id, group in rescued.groupby("sample_id")]
+    grouped.sort(key=lambda x: x[0])
+
+    for sample_rank, (sample_id, sample_df) in enumerate(grouped, start=1):
+        source_image = clean_path(sample_df.iloc[0]["source_image_path"])
+        target_image = clean_path(sample_df.iloc[0]["target_image_path"])
+        if source_image is None or target_image is None:
+            continue
+        if not source_image.exists() or not target_image.exists():
+            continue
+
+        source_thumb, source_orig = load_thumbnail(source_image, max_side=thumb_max_side)
+        target_thumb, target_orig = load_thumbnail(target_image, max_side=thumb_max_side)
+
+        src_boxes: list[tuple[int, int, int, int]] = []
+        tgt_boxes: list[tuple[int, int, int, int]] = []
+        starred_indices: set[int] = set()
+        tiles: list[Image.Image] = []
+
+        for i, row in sample_df.iterrows():
+            global_idx = i + 1
+            source_x = to_int_or_none(row["source_x"])
+            source_y = to_int_or_none(row["source_y"])
+            target_x = to_int_or_none(row["mapped_x"])
+            target_y = to_int_or_none(row["mapped_y"])
+            source_patch_size = to_int_or_none(row["source_patch_size"])
+            target_patch_size = to_int_or_none(row["target_patch_size"])
+            if None in (source_x, source_y, target_x, target_y, source_patch_size, target_patch_size):
+                continue
+
+            source_patch_size = max(1, int(source_patch_size))
+            target_patch_size = max(1, int(target_patch_size))
+            src_boxes.append((int(source_x), int(source_y), source_patch_size, global_idx))
+            tgt_boxes.append((int(target_x), int(target_y), target_patch_size, global_idx))
+            starred_indices.add(global_idx)
+
+            source_patch = extract_patch(source_image, int(source_x), int(source_y), source_patch_size)
+            target_patch = extract_patch(target_image, int(target_x), int(target_y), target_patch_size)
+            tiles.append(build_patch_pair_tile(source_patch, target_patch, global_idx))
+
+            selected_records.append(
+                {
+                    "sample_id": sample_id,
+                    "index_in_sample": int(global_idx),
+                    "source_image_path": str(source_image),
+                    "target_image_path": str(target_image),
+                    "source_x": int(source_x),
+                    "source_y": int(source_y),
+                    "target_x": int(target_x),
+                    "target_y": int(target_y),
+                    "source_patch_size": int(source_patch_size),
+                    "target_patch_size": int(target_patch_size),
+                    "white_fill_rescued": True,
+                }
+            )
+
+        if not tiles:
+            continue
+
+        source_overlay = draw_indexed_boxes(
+            source_thumb,
+            source_orig,
+            src_boxes,
+            starred_indices=starred_indices,
+        )
+        target_overlay = draw_indexed_boxes(
+            target_thumb,
+            target_orig,
+            tgt_boxes,
+            starred_indices=starred_indices,
+        )
+        source_img = Image.fromarray(source_overlay)
+        target_img = Image.fromarray(target_overlay)
+
+        top_h = max(source_img.height, target_img.height)
+        if source_img.height != top_h:
+            new_w = max(1, int(round(source_img.width * (top_h / float(source_img.height)))))
+            source_img = source_img.resize((new_w, top_h), resample=Image.Resampling.BILINEAR)
+        if target_img.height != top_h:
+            new_w = max(1, int(round(target_img.width * (top_h / float(target_img.height)))))
+            target_img = target_img.resize((new_w, top_h), resample=Image.Resampling.BILINEAR)
+
+        top = Image.new("RGB", (source_img.width + target_img.width + 12, top_h), (255, 255, 255))
+        top.paste(source_img, (0, 0))
+        top.paste(target_img, (source_img.width + 12, 0))
+
+        grid = compose_tile_grid(tiles, cols=5, pad=8)
+        header_h = 44
+        panel_w = max(top.width, grid.width)
+        panel_h = header_h + top.height + 12 + grid.height
+        panel = Image.new("RGB", (panel_w, panel_h), (255, 255, 255))
+        draw = ImageDraw.Draw(panel)
+        draw.text(
+            (8, 8),
+            f"sample={sample_id} | rescued_white_fill_patches={len(starred_indices)}",
+            fill="black",
+        )
+        draw.text(
+            (8, 24),
+            "* marks patches that would be partially out-of-bounds without auto-rescue.",
+            fill="black",
+        )
+        panel.paste(top, (0, header_h))
+        panel.paste(grid, (0, header_h + top.height + 12))
+
+        panel_path = panels_dir / f"{sample_rank:03d}_{sample_id}.png"
+        panel.save(panel_path)
+        panel_records.append(
+            {
+                "sample_id": sample_id,
+                "panel_path": str(panel_path),
+                "num_rescued_patches": int(len(starred_indices)),
+            }
+        )
+
+    pd.DataFrame(selected_records).to_csv(output_dir / "auto_rescue_selected_patches.csv", index=False)
+    pd.DataFrame(panel_records).to_csv(output_dir / "auto_rescue_panels_index.csv", index=False)
+    return len(panel_records)
 
 
 def create_mismatch_visual_confirmation(
@@ -907,6 +1140,7 @@ def create_mismatch_visual_confirmation(
         src_boxes_indexed: list[tuple[int, int, int, int]] = []
         tgt_boxes_valid_indexed: list[tuple[int, int, int, int]] = []
         tgt_boxes_invalid_plain: list[tuple[int, int, int]] = []
+        starred_indices: set[int] = set()
 
         for local_idx, row in sample_rows.reset_index(drop=True).iterrows():
             idx = local_idx + 1
@@ -917,9 +1151,12 @@ def create_mismatch_visual_confirmation(
             source_patch_size = to_int_or_none(row["source_patch_size"])
             target_patch_size = to_int_or_none(row["target_patch_size"])
             is_valid = parse_bool_like(row["is_valid"])
+            is_rescued = row_is_white_fill_rescued(row)
 
             if source_x is not None and source_y is not None and source_patch_size is not None:
                 src_boxes_indexed.append((source_x, source_y, max(1, source_patch_size), idx))
+                if is_rescued:
+                    starred_indices.add(idx)
 
             if mapped_x is None or mapped_y is None or target_patch_size is None:
                 continue
@@ -931,8 +1168,18 @@ def create_mismatch_visual_confirmation(
             else:
                 tgt_boxes_invalid_plain.append((mapped_x, mapped_y, max(1, target_patch_size)))
 
-        source_overlay = draw_indexed_boxes(source_thumb, source_orig, src_boxes_indexed)
-        target_overlay = draw_indexed_boxes(target_thumb, target_orig, tgt_boxes_valid_indexed)
+        source_overlay = draw_indexed_boxes(
+            source_thumb,
+            source_orig,
+            src_boxes_indexed,
+            starred_indices=starred_indices,
+        )
+        target_overlay = draw_indexed_boxes(
+            target_thumb,
+            target_orig,
+            tgt_boxes_valid_indexed,
+            starred_indices=starred_indices,
+        )
         target_overlay = draw_outline_boxes(
             target_overlay,
             target_orig,
@@ -961,6 +1208,7 @@ def create_mismatch_visual_confirmation(
         delta = int(count_row["delta_odo_minus_nodo"])
         valid_rows = int(sample_rows["is_valid"].map(parse_bool_like).sum())
         total_rows = int(len(sample_rows))
+        rescued_rows = int(sample_rows.apply(row_is_white_fill_rescued, axis=1).sum())
 
         header_h = 44
         panel = Image.new("RGB", (top.width, header_h + top.height), (255, 255, 255))
@@ -972,7 +1220,7 @@ def create_mismatch_visual_confirmation(
         )
         draw.text(
             (8, 24),
-            f"rows_total={total_rows} mapped_valid={valid_rows} | red boxes on ODO = invalid mapped coords in report",
+            f"rows_total={total_rows} mapped_valid={valid_rows} rescued_white_fill={rescued_rows} | * = rescued, red boxes = invalid",
             fill="black",
         )
         panel.paste(top, (0, header_h))
@@ -989,6 +1237,7 @@ def create_mismatch_visual_confirmation(
                 "delta_odo_minus_nodo": delta,
                 "rows_total": total_rows,
                 "rows_valid": valid_rows,
+                "rows_rescued_white_fill": rescued_rows,
             }
         )
 
@@ -1082,6 +1331,25 @@ def main(argv: list[str] | None = None) -> int:
             raise FileNotFoundError(f"Expected paired mapping report not found: {paired_report_csv}")
         if not mapped_manifest_csv.exists():
             raise FileNotFoundError(f"Expected mapped ODO manifest not found: {mapped_manifest_csv}")
+
+        if args.pairing_auto_rescue_x_shift:
+            rescue_visual_dir = visual_confirmation_dir / "pairing_auto_rescue_cases"
+            try:
+                rescue_panels = create_auto_rescue_visual_confirmation(
+                    mapped_csv=paired_report_csv,
+                    output_dir=rescue_visual_dir,
+                    thumb_max_side=int(args.qc_thumb_max_side),
+                )
+                print(
+                    "[MULTIMODAL] Wrote pairing auto-rescue visualizations: "
+                    f"{rescue_panels} panel(s) at {rescue_visual_dir}"
+                )
+            except Exception as rescue_vis_exc:
+                print(
+                    "[MULTIMODAL][WARN] Failed to generate pairing auto-rescue visualizations: "
+                    f"{type(rescue_vis_exc).__name__}: {rescue_vis_exc}",
+                    file=sys.stderr,
+                )
 
         odo_counts = collect_patch_counts(mapped_coords_patches_dir, list(nodo_counts.keys()))
         count_report_csv = odo_profile_root / "count_check_report.csv"
