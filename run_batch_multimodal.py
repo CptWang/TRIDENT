@@ -572,6 +572,45 @@ def draw_indexed_boxes(
     return np.asarray(image)
 
 
+def to_int_or_none(value: Any) -> int | None:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    return int(round(v))
+
+
+def draw_outline_boxes(
+    thumb_rgb: np.ndarray,
+    orig_size: tuple[int, int],
+    boxes: list[tuple[int, int, int]],
+    color: str,
+) -> np.ndarray:
+    if not boxes:
+        return np.asarray(thumb_rgb)
+
+    image = Image.fromarray(np.asarray(thumb_rgb))
+    draw = ImageDraw.Draw(image)
+
+    orig_w, orig_h = orig_size
+    thumb_w, thumb_h = image.size
+    sx = float(thumb_w) / float(max(orig_w, 1))
+    sy = float(thumb_h) / float(max(orig_h, 1))
+    thickness = max(2, int(round(min(thumb_w, thumb_h) * 0.004)))
+
+    for x, y, patch_size in boxes:
+        x0 = int(round(x * sx))
+        y0 = int(round(y * sy))
+        x1 = int(round((x + patch_size) * sx))
+        y1 = int(round((y + patch_size) * sy))
+        for offset in range(thickness):
+            draw.rectangle([x0 - offset, y0 - offset, x1 + offset, y1 + offset], outline=color)
+
+    return np.asarray(image)
+
+
 def allocate_balanced(total: int, availability: dict[str, int]) -> dict[str, int]:
     keys = list(availability.keys())
     alloc = {k: 0 for k in keys}
@@ -791,6 +830,163 @@ def create_visual_confirmation(
     return total_selected
 
 
+def create_mismatch_visual_confirmation(
+    mapped_csv: Path,
+    count_report_csv: Path,
+    output_dir: Path,
+    thumb_max_side: int = 1200,
+) -> int:
+    if not mapped_csv.exists():
+        raise FileNotFoundError(f"Mapped CSV not found: {mapped_csv}")
+    if not count_report_csv.exists():
+        raise FileNotFoundError(f"Count report CSV not found: {count_report_csv}")
+
+    mapped_df = pd.read_csv(mapped_csv)
+    count_df = pd.read_csv(count_report_csv)
+
+    required_mapped = [
+        "sample_id",
+        "source_x",
+        "source_y",
+        "mapped_x",
+        "mapped_y",
+        "source_image_path",
+        "target_image_path",
+        "source_patch_size",
+        "target_patch_size",
+        "is_valid",
+    ]
+    missing_mapped = [c for c in required_mapped if c not in mapped_df.columns]
+    if missing_mapped:
+        raise ValueError(f"Mapped CSV missing columns for mismatch visualization: {missing_mapped}")
+
+    required_count = ["sample_id", "nodo_patch_count", "odo_patch_count", "delta_odo_minus_nodo", "is_match"]
+    missing_count = [c for c in required_count if c not in count_df.columns]
+    if missing_count:
+        raise ValueError(f"Count report CSV missing columns for mismatch visualization: {missing_count}")
+
+    mismatch_df = count_df[~count_df["is_match"].map(parse_bool_like)].copy()
+    if mismatch_df.empty:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "panels").mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([]).to_csv(output_dir / "mismatch_panels_index.csv", index=False)
+        return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    panels_dir = output_dir / "panels"
+    panels_dir.mkdir(parents=True, exist_ok=True)
+
+    panel_records: list[dict[str, Any]] = []
+    mismatch_samples = mismatch_df["sample_id"].astype(str).tolist()
+
+    for sample_rank, sample_id in enumerate(mismatch_samples, start=1):
+        sample_rows = mapped_df[mapped_df["sample_id"].astype(str) == str(sample_id)].copy()
+        if sample_rows.empty:
+            continue
+
+        source_image = clean_path(sample_rows.iloc[0]["source_image_path"])
+        target_image = clean_path(sample_rows.iloc[0]["target_image_path"])
+        if source_image is None or target_image is None:
+            continue
+        if not source_image.exists() or not target_image.exists():
+            continue
+
+        source_thumb, source_orig = load_thumbnail(source_image, max_side=thumb_max_side)
+        target_thumb, target_orig = load_thumbnail(target_image, max_side=thumb_max_side)
+
+        src_boxes_indexed: list[tuple[int, int, int, int]] = []
+        tgt_boxes_valid_indexed: list[tuple[int, int, int, int]] = []
+        tgt_boxes_invalid_plain: list[tuple[int, int, int]] = []
+
+        for local_idx, row in sample_rows.reset_index(drop=True).iterrows():
+            idx = local_idx + 1
+            source_x = to_int_or_none(row["source_x"])
+            source_y = to_int_or_none(row["source_y"])
+            mapped_x = to_int_or_none(row["mapped_x"])
+            mapped_y = to_int_or_none(row["mapped_y"])
+            source_patch_size = to_int_or_none(row["source_patch_size"])
+            target_patch_size = to_int_or_none(row["target_patch_size"])
+            is_valid = parse_bool_like(row["is_valid"])
+
+            if source_x is not None and source_y is not None and source_patch_size is not None:
+                src_boxes_indexed.append((source_x, source_y, max(1, source_patch_size), idx))
+
+            if mapped_x is None or mapped_y is None or target_patch_size is None:
+                continue
+            if mapped_x < 0 or mapped_y < 0:
+                continue
+
+            if is_valid:
+                tgt_boxes_valid_indexed.append((mapped_x, mapped_y, max(1, target_patch_size), idx))
+            else:
+                tgt_boxes_invalid_plain.append((mapped_x, mapped_y, max(1, target_patch_size)))
+
+        source_overlay = draw_indexed_boxes(source_thumb, source_orig, src_boxes_indexed)
+        target_overlay = draw_indexed_boxes(target_thumb, target_orig, tgt_boxes_valid_indexed)
+        target_overlay = draw_outline_boxes(
+            target_overlay,
+            target_orig,
+            tgt_boxes_invalid_plain,
+            color="#ff3b30",
+        )
+
+        source_img = Image.fromarray(source_overlay)
+        target_img = Image.fromarray(target_overlay)
+
+        top_h = max(source_img.height, target_img.height)
+        if source_img.height != top_h:
+            new_w = max(1, int(round(source_img.width * (top_h / float(source_img.height)))))
+            source_img = source_img.resize((new_w, top_h), resample=Image.Resampling.BILINEAR)
+        if target_img.height != top_h:
+            new_w = max(1, int(round(target_img.width * (top_h / float(target_img.height)))))
+            target_img = target_img.resize((new_w, top_h), resample=Image.Resampling.BILINEAR)
+
+        top = Image.new("RGB", (source_img.width + target_img.width + 12, top_h), (255, 255, 255))
+        top.paste(source_img, (0, 0))
+        top.paste(target_img, (source_img.width + 12, 0))
+
+        count_row = mismatch_df[mismatch_df["sample_id"].astype(str) == str(sample_id)].iloc[0]
+        nodo_count = int(count_row["nodo_patch_count"])
+        odo_count = int(count_row["odo_patch_count"])
+        delta = int(count_row["delta_odo_minus_nodo"])
+        valid_rows = int(sample_rows["is_valid"].map(parse_bool_like).sum())
+        total_rows = int(len(sample_rows))
+
+        header_h = 44
+        panel = Image.new("RGB", (top.width, header_h + top.height), (255, 255, 255))
+        draw = ImageDraw.Draw(panel)
+        draw.text(
+            (8, 8),
+            f"sample={sample_id} | nodo_count={nodo_count} odo_count={odo_count} delta={delta}",
+            fill="black",
+        )
+        draw.text(
+            (8, 24),
+            f"rows_total={total_rows} mapped_valid={valid_rows} | red boxes on ODO = invalid mapped coords in report",
+            fill="black",
+        )
+        panel.paste(top, (0, header_h))
+
+        panel_path = panels_dir / f"{sample_rank:03d}_{sample_id}.png"
+        panel.save(panel_path)
+
+        panel_records.append(
+            {
+                "sample_id": str(sample_id),
+                "panel_path": str(panel_path),
+                "nodo_patch_count": nodo_count,
+                "odo_patch_count": odo_count,
+                "delta_odo_minus_nodo": delta,
+                "rows_total": total_rows,
+                "rows_valid": valid_rows,
+            }
+        )
+
+    panels_csv = output_dir / "mismatch_panels_index.csv"
+    pd.DataFrame(panel_records).to_csv(panels_csv, index=False)
+    return len(panel_records)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     ensure_supported_task(args.modality, args.task)
@@ -885,6 +1081,24 @@ def main(argv: list[str] | None = None) -> int:
             report_csv=count_report_csv,
         )
         if mismatch_count > 0:
+            mismatch_visual_dir = visual_confirmation_dir / "mismatch_cases"
+            try:
+                mismatch_panels = create_mismatch_visual_confirmation(
+                    mapped_csv=paired_report_csv,
+                    count_report_csv=count_report_csv,
+                    output_dir=mismatch_visual_dir,
+                    thumb_max_side=int(args.qc_thumb_max_side),
+                )
+                print(
+                    "[MULTIMODAL] Wrote mismatch visualizations: "
+                    f"{mismatch_panels} panel(s) at {mismatch_visual_dir}"
+                )
+            except Exception as mismatch_vis_exc:
+                print(
+                    "[MULTIMODAL][WARN] Failed to generate mismatch visualizations before raising: "
+                    f"{type(mismatch_vis_exc).__name__}: {mismatch_vis_exc}",
+                    file=sys.stderr,
+                )
             raise ValueError(
                 f"NODO/ODO patch count mismatch detected in {mismatch_count} samples. "
                 f"See report: {count_report_csv}"
