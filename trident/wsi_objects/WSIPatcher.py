@@ -390,22 +390,69 @@ class WSIPatcher:
         return self.cols, self.rows
       
     def get_tile_xy(self, x: int, y: int) -> Tuple[np.ndarray, int, int]:
+        x = int(x)
+        y = int(y)
+        level_downsample = float(self.wsi.level_downsamples[self.level])
+        patch_size_level = int(self.patch_size_level)
 
-        tile = self.wsi.read_region(
-            location=(x, y),
-            level=self.level,
-            size=(self.patch_size_level, self.patch_size_level),
-            read_as='pil' if self.pil else 'numpy'
-        )
+        # Compute overlap between requested level-0 patch box and slide bounds.
+        x0_req = x
+        y0_req = y
+        x1_req = x + int(self.patch_size_src)
+        y1_req = y + int(self.patch_size_src)
 
-        if self.patch_size_target is not None:
-            if self.pil:
-                tile = tile.resize((self.patch_size_target, self.patch_size_target))
+        x0_clip = max(0, x0_req)
+        y0_clip = max(0, y0_req)
+        x1_clip = min(int(self.width), x1_req)
+        y1_clip = min(int(self.height), y1_req)
+
+        canvas = np.full((patch_size_level, patch_size_level, 3), 255, dtype=np.uint8)
+
+        if x1_clip > x0_clip and y1_clip > y0_clip:
+            read_x = int(x0_clip)
+            read_y = int(y0_clip)
+            read_w = max(1, int(round((x1_clip - x0_clip) / level_downsample)))
+            read_h = max(1, int(round((y1_clip - y0_clip) / level_downsample)))
+
+            region = self.wsi.read_region(
+                location=(read_x, read_y),
+                level=self.level,
+                size=(read_w, read_h),
+                read_as='numpy',
+            )
+            region = np.asarray(region)
+            if region.ndim == 2:
+                region = np.repeat(region[..., None], 3, axis=2)
+            elif region.ndim == 3:
+                if region.shape[2] == 1:
+                    region = np.repeat(region, 3, axis=2)
+                elif region.shape[2] > 3:
+                    region = region[:, :, :3]
             else:
-                tile = cv2.resize(tile, (self.patch_size_target, self.patch_size_target))[:, :, :3]
+                raise ValueError(f"Unexpected patch region shape from reader: {region.shape}")
 
-        assert x < self.width and y < self.height
-        return tile, x, y
+            if region.dtype != np.uint8:
+                region = np.clip(region, 0, 255).astype(np.uint8)
+
+            dst_x = int(round((x0_clip - x0_req) / level_downsample))
+            dst_y = int(round((y0_clip - y0_req) / level_downsample))
+            dst_x = max(0, min(dst_x, patch_size_level))
+            dst_y = max(0, min(dst_y, patch_size_level))
+
+            copy_h = min(int(region.shape[0]), patch_size_level - dst_y)
+            copy_w = min(int(region.shape[1]), patch_size_level - dst_x)
+            if copy_h > 0 and copy_w > 0:
+                canvas[dst_y : dst_y + copy_h, dst_x : dst_x + copy_w] = region[:copy_h, :copy_w]
+
+        tile_np = canvas
+        if self.patch_size_target is not None and (
+            tile_np.shape[0] != self.patch_size_target or tile_np.shape[1] != self.patch_size_target
+        ):
+            tile_np = cv2.resize(tile_np, (self.patch_size_target, self.patch_size_target))
+
+        if self.pil:
+            return Image.fromarray(tile_np), x, y
+        return tile_np[:, :, :3], x, y
     
     def get_tile(self, col: int, row: int) -> Tuple[np.ndarray, int, int]:
         """ Get tile at position (column, row).
