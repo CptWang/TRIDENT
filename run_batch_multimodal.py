@@ -132,6 +132,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable elastic mapping when constructing paired ODO coordinates.",
     )
     parser.add_argument(
+        "--elastic_only_samples",
+        action="append",
+        default=[],
+        help=(
+            "Comma-separated sample IDs that should force elastic registration and skip "
+            "the global affine during paired ODO mapping. May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--elastic_only_samples_file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional text file with one sample ID per line. These samples force elastic "
+            "registration and skip the global affine during paired ODO mapping."
+        ),
+    )
+    parser.add_argument(
         "--pairing_allow_missing",
         action="store_true",
         help="Allow paired-mapping script to continue on sample errors.",
@@ -185,6 +203,58 @@ def validate_wsi_paths(df: pd.DataFrame, wsi_col: str, csv_path: Path) -> None:
     if bool(empty_mask.any()):
         bad_rows = (df.index[empty_mask] + 2).tolist()
         raise ValueError(f"Column '{wsi_col}' has empty values at rows {bad_rows[:10]} in {csv_path}")
+
+
+def validate_odo_feature_manifest_targets(
+    *,
+    combined_df: pd.DataFrame,
+    mapped_manifest_csv: Path,
+    sample_col: str,
+    wsi_odo_col: str,
+) -> None:
+    """Ensure the generated ODO feature manifest still points to original wsi_odo images."""
+    mapped_df = pd.read_csv(mapped_manifest_csv)
+    require_manifest_columns(mapped_df, ["sample_id", "wsi", "wsi_name"], mapped_manifest_csv)
+
+    expected_by_sample = (
+        combined_df.assign(
+            _sample_id=combined_df[sample_col].fillna("").astype(str).str.strip(),
+            _wsi_odo=combined_df[wsi_odo_col].fillna("").astype(str).str.strip(),
+        )
+        .set_index("_sample_id")["_wsi_odo"]
+        .to_dict()
+    )
+
+    mismatches: list[str] = []
+    missing_samples: list[str] = []
+    bad_names: list[str] = []
+    for row_index, row in mapped_df.iterrows():
+        sample_id = str(row.get("sample_id", "")).strip()
+        mapped_wsi = str(row.get("wsi", "")).strip()
+        mapped_name = str(row.get("wsi_name", "")).strip()
+        expected_wsi = expected_by_sample.get(sample_id)
+        if expected_wsi is None:
+            missing_samples.append(sample_id or f"<empty row {row_index + 2}>")
+            continue
+        if mapped_wsi != expected_wsi:
+            mismatches.append(
+                f"{sample_id}: mapped wsi={mapped_wsi!r}, expected {wsi_odo_col}={expected_wsi!r}"
+            )
+        if mapped_name != sample_id:
+            bad_names.append(f"{sample_id}: wsi_name={mapped_name!r}")
+
+    if missing_samples or mismatches or bad_names:
+        details: list[str] = []
+        if missing_samples:
+            details.append(f"missing samples={missing_samples[:10]}")
+        if mismatches:
+            details.append(f"wsi mismatches={mismatches[:5]}")
+        if bad_names:
+            details.append(f"wsi_name mismatches={bad_names[:5]}")
+        raise ValueError(
+            "Generated ODO feature manifest does not match the image-level ODO inputs. "
+            + "; ".join(details)
+        )
 
 
 def create_modality_manifest(
@@ -345,6 +415,10 @@ def run_paired_mapping(
     ]
     if args.disable_elastic:
         cmd.append("--disable-elastic")
+    for sample_values in args.elastic_only_samples:
+        cmd.extend(["--elastic-only-samples", str(sample_values)])
+    if args.elastic_only_samples_file is not None:
+        cmd.extend(["--elastic-only-samples-file", str(args.elastic_only_samples_file)])
     if args.pairing_allow_missing:
         cmd.append("--allow-missing")
     if args.pairing_auto_rescue_x_shift:
@@ -353,26 +427,35 @@ def run_paired_mapping(
     subprocess.run(cmd, check=True)
 
 
-def collect_patch_counts(coords_patches_dir: Path, sample_ids: list[str]) -> dict[str, int]:
+def collect_patch_counts(
+    coords_patches_dir: Path,
+    sample_ids: list[str],
+    allow_missing: bool = False,
+) -> tuple[dict[str, int], list[str]]:
     counts: dict[str, int] = {}
+    missing: list[str] = []
     for sample_id in sample_ids:
         coords_h5 = coords_patches_dir / f"{sample_id}_patches.h5"
         if not coords_h5.exists():
+            if allow_missing:
+                missing.append(sample_id)
+                continue
             raise FileNotFoundError(
                 f"Missing mapped ODO coords for sample '{sample_id}': expected {coords_h5}"
             )
         counts[sample_id] = int(read_coords_h5(coords_h5).shape[0])
-    return counts
+    return counts, missing
 
 
 def compare_patch_counts(
     nodo_counts: dict[str, int],
     odo_counts: dict[str, int],
     report_csv: Path,
-) -> int:
+) -> tuple[int, list[str]]:
     sample_ids = sorted(set(nodo_counts.keys()) | set(odo_counts.keys()))
     rows: list[dict[str, Any]] = []
     mismatches = 0
+    mismatch_samples: list[str] = []
 
     for sample_id in sample_ids:
         n_count = int(nodo_counts.get(sample_id, -1))
@@ -380,6 +463,7 @@ def compare_patch_counts(
         is_match = n_count == o_count
         if not is_match:
             mismatches += 1
+            mismatch_samples.append(sample_id)
         rows.append(
             {
                 "sample_id": sample_id,
@@ -392,7 +476,7 @@ def compare_patch_counts(
 
     report_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(report_csv, index=False)
-    return mismatches
+    return mismatches, mismatch_samples
 
 
 def open_zarr_array(path: Path):
@@ -1331,6 +1415,12 @@ def main(argv: list[str] | None = None) -> int:
             raise FileNotFoundError(f"Expected paired mapping report not found: {paired_report_csv}")
         if not mapped_manifest_csv.exists():
             raise FileNotFoundError(f"Expected mapped ODO manifest not found: {mapped_manifest_csv}")
+        validate_odo_feature_manifest_targets(
+            combined_df=combined_df,
+            mapped_manifest_csv=mapped_manifest_csv,
+            sample_col=args.sample_id_column,
+            wsi_odo_col=args.wsi_odo_column,
+        )
 
         if args.pairing_auto_rescue_x_shift:
             rescue_visual_dir = visual_confirmation_dir / "pairing_auto_rescue_cases"
@@ -1351,10 +1441,31 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
 
-        odo_counts = collect_patch_counts(mapped_coords_patches_dir, list(nodo_counts.keys()))
+        odo_counts, missing_odo_coord_samples = collect_patch_counts(
+            mapped_coords_patches_dir,
+            list(nodo_counts.keys()),
+            allow_missing=bool(args.pairing_allow_missing),
+        )
+        count_check_nodo_counts = nodo_counts
+        if missing_odo_coord_samples:
+            missing_preview = ", ".join(missing_odo_coord_samples[:10])
+            suffix = "" if len(missing_odo_coord_samples) <= 10 else ", ..."
+            print(
+                "[MULTIMODAL][WARN] Skipping "
+                f"{len(missing_odo_coord_samples)} sample(s) without mapped ODO coords after "
+                f"--pairing_allow_missing: {missing_preview}{suffix}",
+                file=sys.stderr,
+            )
+            missing_set = set(missing_odo_coord_samples)
+            count_check_nodo_counts = {
+                sample_id: count
+                for sample_id, count in nodo_counts.items()
+                if sample_id not in missing_set
+            }
+
         count_report_csv = odo_profile_root / "count_check_report.csv"
-        mismatch_count = compare_patch_counts(
-            nodo_counts=nodo_counts,
+        mismatch_count, mismatch_samples = compare_patch_counts(
+            nodo_counts=count_check_nodo_counts,
             odo_counts=odo_counts,
             report_csv=count_report_csv,
         )
@@ -1377,9 +1488,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"{type(mismatch_vis_exc).__name__}: {mismatch_vis_exc}",
                     file=sys.stderr,
                 )
+            mismatch_preview = ", ".join(mismatch_samples[:10])
+            suffix = "" if len(mismatch_samples) <= 10 else ", ..."
             raise ValueError(
-                f"NODO/ODO patch count mismatch detected in {mismatch_count} samples. "
-                f"See report: {count_report_csv}"
+                f"NODO/ODO patch count mismatch detected in {mismatch_count} samples "
+                f"({mismatch_preview}{suffix}). See report: {count_report_csv}"
             )
 
         selected_qc_count = create_visual_confirmation(
@@ -1398,6 +1511,13 @@ def main(argv: list[str] | None = None) -> int:
         odo_args.custom_list_of_wsis = str(mapped_manifest_csv)
         odo_args.coords_dir = f"{coords_profile}/coords"
         odo_args.wsi_name_column = "wsi_name"
+        # The generated ODO manifest is feature-only and does not carry the
+        # image-level manual mask or annotation columns. ODO tissue selection
+        # has already happened through NODO coords plus paired mapping, and
+        # paired training labels are read from the NODO patch H5 files.
+        odo_args.manual_tissue_mask_column = None
+        odo_args.annotation_vote_column = None
+        odo_args.segmentation_source = "model"
         run_trident_job(odo_args)
 
     print(
