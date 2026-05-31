@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TextIO
 
 
 EMPTY_TOKENS = {"", "na", "n/a", "none", "null", "nan", "empty"}
@@ -273,6 +274,10 @@ def normalized_modality(unknown_args: list[str]) -> str:
     return str(get_option(unknown_args, "--modality", "both")).strip().lower()
 
 
+def normalized_task(unknown_args: list[str]) -> str:
+    return str(get_option(unknown_args, "--task", "seg")).strip().lower()
+
+
 def default_coords_profile(unknown_args: list[str]) -> str:
     coords_dir = get_option(unknown_args, "--coords_dir")
     if coords_dir:
@@ -297,6 +302,23 @@ def append_option_if_present(cmd: list[str], args: list[str], option: str) -> No
         cmd.extend([option, value])
 
 
+def parse_cuda_visible_devices(raw_value: str | None = None) -> list[str]:
+    value = raw_value if raw_value is not None else os.environ.get("CUDA_VISIBLE_DEVICES")
+    if value is None:
+        return []
+    tokens = [token.strip() for token in str(value).split(",")]
+    return [token for token in tokens if token]
+
+
+def round_robin_row_partitions(rows: list[dict[str, str]], num_partitions: int) -> list[list[dict[str, str]]]:
+    if num_partitions <= 0:
+        raise ValueError("num_partitions must be > 0")
+    partitions: list[list[dict[str, str]]] = [[] for _ in range(num_partitions)]
+    for row_idx, row in enumerate(rows):
+        partitions[row_idx % num_partitions].append(row)
+    return partitions
+
+
 def mapped_odo_paths(job_dir: Path, coords_profile: str) -> tuple[Path, Path, Path]:
     odo_profile_root = job_dir / "ODO" / coords_profile
     return (
@@ -306,11 +328,12 @@ def mapped_odo_paths(job_dir: Path, coords_profile: str) -> tuple[Path, Path, Pa
     )
 
 
-def build_direct_odo_feature_command(
+def build_direct_feature_command(
     unknown_args: list[str],
-    args: argparse.Namespace,
-    mapped_manifest_csv: Path,
-    coords_profile: str,
+    *,
+    job_dir: Path,
+    manifest_csv: Path,
+    coords_dir: str,
 ) -> list[str]:
     runner = Path(__file__).with_name("run_batch_of_slides.py")
     cmd = [
@@ -319,13 +342,13 @@ def build_direct_odo_feature_command(
         "--task",
         "feat",
         "--job_dir",
-        str(args.job_dir / "ODO"),
+        str(job_dir),
         "--wsi_dir",
         str(get_option(unknown_args, "--wsi_dir", "/") or "/"),
         "--custom_list_of_wsis",
-        str(mapped_manifest_csv),
+        str(manifest_csv),
         "--coords_dir",
-        f"{coords_profile}/coords",
+        coords_dir,
         "--wsi_name_column",
         "wsi_name",
         "--segmentation_source",
@@ -333,7 +356,6 @@ def build_direct_odo_feature_command(
     ]
 
     for option in [
-        "--gpu",
         "--reader_type",
         "--mag",
         "--patch_size",
@@ -356,12 +378,88 @@ def build_direct_odo_feature_command(
     return cmd
 
 
+def run_sharded_feature_extraction(
+    *,
+    stage_name: str,
+    manifest_csv: Path,
+    job_dir: Path,
+    coords_dir: str,
+    unknown_args: list[str],
+    gpu_tokens: list[str],
+) -> None:
+    if len(gpu_tokens) <= 1:
+        raise ValueError("run_sharded_feature_extraction requires at least 2 GPU tokens")
+
+    fieldnames, rows = read_csv(manifest_csv)
+    if not rows:
+        raise ValueError(f"Cannot shard empty feature manifest: {manifest_csv}")
+
+    shard_root = job_dir / "_multigpu_shards" / stage_name
+    shard_root.mkdir(parents=True, exist_ok=True)
+    partitions = round_robin_row_partitions(rows, len(gpu_tokens))
+
+    workers: list[tuple[subprocess.Popen, list[str], Path, TextIO]] = []
+    for shard_idx, (gpu_token, shard_rows) in enumerate(zip(gpu_tokens, partitions)):
+        if not shard_rows:
+            continue
+        shard_csv = shard_root / f"manifest_shard_{shard_idx:02d}.csv"
+        write_csv(shard_csv, fieldnames, shard_rows)
+
+        worker_cmd = build_direct_feature_command(
+            unknown_args=unknown_args,
+            job_dir=job_dir,
+            manifest_csv=shard_csv,
+            coords_dir=coords_dir,
+        )
+        worker_cmd.extend(["--gpu", "0"])
+
+        worker_env = os.environ.copy()
+        worker_env["CUDA_VISIBLE_DEVICES"] = gpu_token
+
+        log_path = shard_root / f"worker_{shard_idx:02d}_gpu_{gpu_token}.log"
+        log_handle = log_path.open("w", encoding="utf-8")
+        log_handle.write(f"# cmd: {' '.join(worker_cmd)}\n")
+        log_handle.flush()
+
+        print(
+            f"[3D] Launching shard stage={stage_name} shard={shard_idx} gpu={gpu_token} "
+            f"rows={len(shard_rows)} manifest={shard_csv}"
+        )
+        proc = subprocess.Popen(
+            worker_cmd,
+            env=worker_env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        workers.append((proc, worker_cmd, log_path, log_handle))
+
+    failures: list[tuple[int, list[str], Path]] = []
+    for proc, worker_cmd, log_path, log_handle in workers:
+        try:
+            return_code = proc.wait()
+        finally:
+            log_handle.close()
+        if return_code != 0:
+            failures.append((return_code, worker_cmd, log_path))
+
+    if failures:
+        return_code, failed_cmd, failed_log = failures[0]
+        print(
+            f"[3D][ERR] Sharded feature worker failed rc={return_code}. "
+            f"See log: {failed_log}",
+            file=sys.stderr,
+        )
+        raise subprocess.CalledProcessError(return_code, failed_cmd)
+
+
 def run_odo_with_2d_count_mismatch_tolerance(
     *,
     odo_cmd: list[str],
     unknown_args: list[str],
     args: argparse.Namespace,
-) -> None:
+    run_direct_feat: bool = True,
+) -> Path:
     coords_profile = default_coords_profile(unknown_args)
     mapped_manifest_csv, paired_report_csv, mapped_coords_patches_dir = mapped_odo_paths(
         args.job_dir,
@@ -376,7 +474,7 @@ def run_odo_with_2d_count_mismatch_tolerance(
     else:
         result = subprocess.run(odo_cmd, check=False)
         if result.returncode == 0:
-            return
+            return mapped_manifest_csv
         if args.strict_pair_counts:
             raise subprocess.CalledProcessError(result.returncode, odo_cmd)
         if not mapped_manifest_csv.exists() or not paired_report_csv.exists() or not mapped_coords_patches_dir.is_dir():
@@ -387,15 +485,20 @@ def run_odo_with_2d_count_mismatch_tolerance(
             "ODO patches than the reused NODO source. Continuing with ODO feature extraction."
         )
 
-    feat_cmd = build_direct_odo_feature_command(
+    if not run_direct_feat:
+        return mapped_manifest_csv
+
+    feat_cmd = build_direct_feature_command(
         unknown_args=unknown_args,
-        args=args,
-        mapped_manifest_csv=mapped_manifest_csv,
-        coords_profile=coords_profile,
+        job_dir=args.job_dir / "ODO",
+        manifest_csv=mapped_manifest_csv,
+        coords_dir=f"{coords_profile}/coords",
     )
+    append_option_if_present(feat_cmd, unknown_args, "--gpu")
     print("[3D] ODO direct feature command:")
     print(" ".join(feat_cmd))
     subprocess.run(feat_cmd, check=True)
+    return mapped_manifest_csv
 
 
 def materialize_alias(src: Path, dst: Path, mode: str) -> bool:
@@ -535,6 +638,11 @@ def main(argv: list[str] | None = None) -> int:
         expanded_elastic_only_samples=expanded_elastic_only,
     )
     use_optimized_nodo_reuse = (not args.no_reuse_nodo) and normalized_modality(unknown_args) == "both"
+    requested_task = normalized_task(unknown_args)
+    visible_gpu_tokens = parse_cuda_visible_devices()
+    use_multi_gpu_feat = use_optimized_nodo_reuse and requested_task == "all" and len(visible_gpu_tokens) > 1
+    coords_profile = default_coords_profile(unknown_args)
+
     nodo_cmd = build_run_command(
         unknown_args=unknown_args,
         args=args,
@@ -561,12 +669,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     if expanded_elastic_only:
         print(f"[3D] Expanded elastic-only sample IDs: {len(expanded_elastic_only)}")
+    if visible_gpu_tokens:
+        print(f"[3D] CUDA_VISIBLE_DEVICES parsed as: {','.join(visible_gpu_tokens)}")
+
     if use_optimized_nodo_reuse:
-        print("[3D] Optimized NODO reuse is enabled.")
-        print("[3D] NODO command:")
-        print(" ".join(nodo_cmd))
-        print("[3D] ODO command:")
-        print(" ".join(odo_cmd))
+        if use_multi_gpu_feat:
+            print("[3D] Optimized NODO reuse is enabled with multi-GPU feature sharding.")
+        else:
+            print("[3D] Optimized NODO reuse is enabled.")
+            print("[3D] NODO command:")
+            print(" ".join(nodo_cmd))
+            print("[3D] ODO command:")
+            print(" ".join(odo_cmd))
     else:
         print("[3D] Optimized NODO reuse is disabled; using one full adapted-manifest command.")
         print("[3D] run_batch_multimodal.py command:")
@@ -576,25 +690,111 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if use_optimized_nodo_reuse:
-        subprocess.run(nodo_cmd, check=True)
-        alias_counts = materialize_nodo_aliases(
-            job_dir=args.job_dir,
-            coords_profile=default_coords_profile(unknown_args),
-            patch_encoder=patch_encoder_name(unknown_args),
-            by_source_sample=by_source_sample,
-            alias_mode=args.alias_mode,
-        )
-        print(
-            "[3D] Materialized NODO aliases: "
-            f"patches={alias_counts['patches']} "
-            f"features={alias_counts['features']} "
-            f"slide_features={alias_counts['slide_features']}"
-        )
-        run_odo_with_2d_count_mismatch_tolerance(
-            odo_cmd=odo_cmd,
-            unknown_args=unknown_args,
-            args=args,
-        )
+        if use_multi_gpu_feat:
+            nodo_seg_cmd = build_run_command(
+                unknown_args=unknown_args,
+                args=args,
+                manifest_csv=source_manifest_csv,
+                sample_id_column=args.trident_sample_id_column,
+                expanded_elastic_only_samples=[],
+                extra_overrides=["--modality", "nodo", "--task", "seg"],
+            )
+            nodo_coords_cmd = build_run_command(
+                unknown_args=unknown_args,
+                args=args,
+                manifest_csv=source_manifest_csv,
+                sample_id_column=args.trident_sample_id_column,
+                expanded_elastic_only_samples=[],
+                extra_overrides=["--modality", "nodo", "--task", "coords"],
+            )
+            odo_mapping_cmd = build_run_command(
+                unknown_args=unknown_args,
+                args=args,
+                manifest_csv=adapted_manifest_csv,
+                sample_id_column=args.trident_sample_id_column,
+                expanded_elastic_only_samples=expanded_elastic_only,
+                extra_overrides=[
+                    "--modality",
+                    "odo",
+                    "--task",
+                    "feat",
+                    "--nodo-job-dir",
+                    str(args.job_dir / "NODO"),
+                    "--_skip_odo_final_feat",
+                ],
+            )
+
+            print("[3D] NODO seg command:")
+            print(" ".join(nodo_seg_cmd))
+            subprocess.run(nodo_seg_cmd, check=True)
+
+            print("[3D] NODO coords command:")
+            print(" ".join(nodo_coords_cmd))
+            subprocess.run(nodo_coords_cmd, check=True)
+
+            nodo_feature_manifest_csv = args.job_dir / "NODO" / "manifest_trident_nodo_multimodal.csv"
+            if not nodo_feature_manifest_csv.exists():
+                raise FileNotFoundError(
+                    "Expected NODO multimodal manifest for sharded feature extraction was not found: "
+                    f"{nodo_feature_manifest_csv}"
+                )
+            run_sharded_feature_extraction(
+                stage_name="nodo_feat",
+                manifest_csv=nodo_feature_manifest_csv,
+                job_dir=args.job_dir / "NODO",
+                coords_dir=coords_profile,
+                unknown_args=unknown_args,
+                gpu_tokens=visible_gpu_tokens,
+            )
+
+            alias_counts = materialize_nodo_aliases(
+                job_dir=args.job_dir,
+                coords_profile=coords_profile,
+                patch_encoder=patch_encoder_name(unknown_args),
+                by_source_sample=by_source_sample,
+                alias_mode=args.alias_mode,
+            )
+            print(
+                "[3D] Materialized NODO aliases: "
+                f"patches={alias_counts['patches']} "
+                f"features={alias_counts['features']} "
+                f"slide_features={alias_counts['slide_features']}"
+            )
+
+            mapped_manifest_csv = run_odo_with_2d_count_mismatch_tolerance(
+                odo_cmd=odo_mapping_cmd,
+                unknown_args=unknown_args,
+                args=args,
+                run_direct_feat=False,
+            )
+            run_sharded_feature_extraction(
+                stage_name="odo_feat",
+                manifest_csv=mapped_manifest_csv,
+                job_dir=args.job_dir / "ODO",
+                coords_dir=f"{coords_profile}/coords",
+                unknown_args=unknown_args,
+                gpu_tokens=visible_gpu_tokens,
+            )
+        else:
+            subprocess.run(nodo_cmd, check=True)
+            alias_counts = materialize_nodo_aliases(
+                job_dir=args.job_dir,
+                coords_profile=coords_profile,
+                patch_encoder=patch_encoder_name(unknown_args),
+                by_source_sample=by_source_sample,
+                alias_mode=args.alias_mode,
+            )
+            print(
+                "[3D] Materialized NODO aliases: "
+                f"patches={alias_counts['patches']} "
+                f"features={alias_counts['features']} "
+                f"slide_features={alias_counts['slide_features']}"
+            )
+            run_odo_with_2d_count_mismatch_tolerance(
+                odo_cmd=odo_cmd,
+                unknown_args=unknown_args,
+                args=args,
+            )
     else:
         subprocess.run(fallback_cmd, check=True)
     return 0

@@ -167,6 +167,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qc_total_patches", type=int, default=30)
     parser.add_argument("--qc_seed", type=int, default=7)
     parser.add_argument("--qc_thumb_max_side", type=int, default=1200)
+    parser.add_argument(
+        "--_skip_odo_final_feat",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     return parser
 
@@ -1505,20 +1510,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[MULTIMODAL] Wrote visual confirmation samples: {selected_qc_count}")
 
-        odo_args = deepcopy(args)
-        odo_args.task = "feat"
-        odo_args.job_dir = str(odo_job_dir)
-        odo_args.custom_list_of_wsis = str(mapped_manifest_csv)
-        odo_args.coords_dir = f"{coords_profile}/coords"
-        odo_args.wsi_name_column = "wsi_name"
-        # The generated ODO manifest is feature-only and does not carry the
-        # image-level manual mask or annotation columns. ODO tissue selection
-        # has already happened through NODO coords plus paired mapping, and
-        # paired training labels are read from the NODO patch H5 files.
-        odo_args.manual_tissue_mask_column = None
-        odo_args.annotation_vote_column = None
-        odo_args.segmentation_source = "model"
-        run_trident_job(odo_args)
+        if not getattr(args, "_skip_odo_final_feat", False):
+            odo_args = deepcopy(args)
+            odo_args.task = "feat"
+            odo_args.job_dir = str(odo_job_dir)
+            odo_args.custom_list_of_wsis = str(mapped_manifest_csv)
+            odo_args.coords_dir = f"{coords_profile}/coords"
+            odo_args.wsi_name_column = "wsi_name"
+            # The generated ODO manifest is feature-only and does not carry the
+            # image-level manual mask or annotation columns. ODO tissue selection
+            # has already happened through NODO coords plus paired mapping, and
+            # paired training labels are read from the NODO patch H5 files.
+            odo_args.manual_tissue_mask_column = None
+            odo_args.annotation_vote_column = None
+            odo_args.segmentation_source = "model"
+            run_trident_job(odo_args)
+        else:
+            print("[MULTIMODAL] Skipping final ODO feature extraction due to internal flag.")
 
     print(
         "[MULTIMODAL] Done. "
